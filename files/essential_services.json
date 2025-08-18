@@ -1,0 +1,15 @@
+{
+  "essential_services": [
+    { "name": "WinRM",             "want_status": "Running", "want_start": "Auto",    "required": true  },
+    { "name": "MpsSvc",            "want_status": "Running", "want_start": "Auto",    "required": true  },
+    { "name": "WinDefend",         "want_status": "Running", "want_start": "Auto",    "required": true  },
+    { "name": "EventLog",          "want_status": "Running", "want_start": "Auto",    "required": true  },
+    { "name": "Dnscache",          "want_status": "Running", "want_start": "Auto",    "required": true  },
+    { "name": "Dhcp",              "want_status": "Running", "want_start": "Auto",    "required": true  },
+    { "name": "LanmanWorkstation", "want_status": "Running", "want_start": "Auto",    "required": true  },
+    { "name": "Schedule",          "want_status": "Running", "want_start": "Auto",    "required": true  },
+    { "name": "wscsvc",            "want_status": "Running", "want_start": "Auto",    "required": false },
+    { "name": "W32Time",           "want_status": "Running", "want_start": "Auto",    "required": false },
+    { "name": "Spooler",           "want_status": "Running", "want_start": "Auto",    "required": true  }
+  ]
+}

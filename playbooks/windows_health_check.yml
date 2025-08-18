@@ -1,7 +1,7 @@
 ---
 - name: Windows health + essential services monitor (robust)
   hosts: windows_desktops
-  gather_facts: no
+  gather_facts: yes
 
   collections:
     - ansible.windows
@@ -19,21 +19,41 @@
 
     # --- Behavior knobs ---
     fail_on_critical: false        # set true to make the play fail on criticals
-    write_report_to: "reports/windows_health_{{ inventory_hostname }}.json"
+    write_report_to: "../reports/windows_health_{{ inventory_hostname }}.json"
 
     # --- Essential services (service names, not display names) ---
-    essential_services:
-      - { name: "WinRM",               want_status: "Running", want_start: "Auto", required: true }
-      - { name: "MpsSvc",              want_status: "Running", want_start: "Auto", required: true }   # Windows Firewall
-      - { name: "WinDefend",           want_status: "Running", want_start: "Auto", required: true }   # Defender AV
-      - { name: "EventLog",            want_status: "Running", want_start: "Auto", required: true }
-      - { name: "Dnscache",            want_status: "Running", want_start: "Auto", required: true }   # DNS Client
-      - { name: "Dhcp",                want_status: "Running", want_start: "Auto", required: true }   # DHCP Client
-      - { name: "LanmanWorkstation",   want_status: "Running", want_start: "Auto", required: true }   # Workstation
-      - { name: "Schedule",            want_status: "Running", want_start: "Auto", required: true }   # Task Scheduler
-      - { name: "wscsvc",              want_status: "Running", want_start: "Auto", required: false }  # Security Center
-      - { name: "W32Time",             want_status: "Running", want_start: "Auto", required: false }  # Windows Time
-      - { name: "Spooler",           want_status: "Running", want_start: "Auto", required: true  }   # Print Spooler ✅
+    essential_services_file: "../files/essential_services.json"
+
+  pre_tasks:
+    - name: Load essential services JSON (controller-side)
+      ansible.builtin.include_vars:
+        file: "{{ essential_services_file }}"
+        name: es_file_content   # whatever the JSON contains goes under this key
+      delegate_to: 127.0.0.1
+
+    - name: Parse essential_services (supports object-with-key or raw list)
+      ansible.builtin.set_fact:
+        essential_services: >-
+          {{
+            es_file_content.essential_services
+              if (es_file_content is mapping and 'essential_services' in es_file_content)
+              else es_file_content
+          }}
+
+    - name: Validate essential_services structure
+      ansible.builtin.assert:
+        that:
+          - essential_services is sequence
+          - (essential_services | length) > 0
+          - (essential_services | selectattr('name','defined')        | list | length) == (essential_services | length)
+          - (essential_services | selectattr('want_status','defined') | list | length) == (essential_services | length)
+          - (essential_services | selectattr('want_start','defined')  | list | length) == (essential_services | length)
+        fail_msg: >
+          essential_services JSON must be a list of objects, each with:
+          name, want_status (Running/Stopped), want_start (Auto/Manual/Disabled).
+          Optional: required (true/false).
+      changed_when: false
+
 
   tasks:
     # -------- Collect metrics (structured) --------
@@ -322,7 +342,7 @@
       ansible.builtin.copy:
         content: |
           {
-            "host": "{{ inventory_hostname }}",
+            "host": "{{ ansible_facts.product_serial }}",
             "timestamp": "{{ report_ts | default('') }}",
             "health": {{ health | to_json }},
             "services": {{ services | to_json }},
@@ -343,3 +363,7 @@
           {{ (alerts | list) + (service_criticals | map(attribute='Name') | list) }}
       when: fail_on_critical | bool and ((alerts | length) > 0 or (service_criticals | length) > 0)
       changed_when: false
+
+    - name: Display all facts
+      ansible.builtin.debug:
+        var: ansible_facts
