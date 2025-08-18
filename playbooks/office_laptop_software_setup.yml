@@ -1,0 +1,349 @@
+---
+- name: Install common apps on Windows the right way
+  hosts: windows_desktops
+  gather_facts: no
+
+  collections:
+    - chocolatey.chocolatey
+    - ansible.windows
+
+  vars:
+    # Toggle what to install
+    install_7zip: false
+    install_anydesk: false
+    install_chrome: true
+    install_adobe_reader: false         # Reader (free). For Acrobat Pro, see below.
+    install_adobe_acrobat_pro: false    # Needs Adobe Admin Console package
+    install_checkpoint: false           # Needs exact product + URL below
+    install_m365_apps: false            # Office via ODT (en-US)
+
+    # Optional version pins for choco packages
+    seven_zip_version: null             # e.g. "23.01"
+    anydesk_version: null
+    chrome_version: null
+    adobereader_version: null
+
+    # ---- Adobe Acrobat Pro (licensed) ----
+    # Build a package in Adobe Admin Console, host it (SMB/HTTP), then set these:
+    acrobat_setup_path: 'C:\Packages\Acrobat\setup.exe'       # or UNC like \\server\share\setup.exe
+    acrobat_setup_args: '/sAll /rs /msi EULA_ACCEPT=YES'       # adjust per your package (MST etc.)
+    acrobat_detect_path: 'C:\Program Files\Adobe\Acrobat\Acrobat\Acrobat.exe'
+
+    # ---- Check Point (example: Endpoint Security VPN) ----
+    checkpoint_installer_local_path: "/mnt/c/Users/Vicky\ Deshpande/Downloads/Call\ Dumps/artefacts/E88.30_CheckPointVPN.msi"
+    checkpoint_product_id: null                 # if you know the MSI ProductCode GUID, set it
+    checkpoint_creates_path: 'C:\Program Files (x86)\CheckPoint\Endpoint Connect\tracsrv.exe'  # adjust
+    checkpoint_install_args: '/qn REBOOT=ReallySuppress'     # common MSI silent flags
+    vpn_site_fqdn: "cvpn.goapl.com"              # the gateway FQDN or IP (this becomes the site ID)
+    vpn_site_display: "GOAPL Standard VPN"               # friendly name shown in the client UI
+    vpn_login_option: "Standard"                  # must match Gateway > VPN Clients > Authentication display name
+    vpn_auth_method: "username-password"          # or 'certificate', 'p12-certificate', etc.
+    vpn_rootca_fingerprint: ""                    # optional: 12-word fingerprint to auto-trust (skip prompt)
+    # Optional cached creds (only if your policy allows this):
+    vpn_username: ""                              # e.g. "vicky"; leave blank to skip caching
+    vpn_password: ""                              # store via Ansible Vault if used
+    lock_sites: true                              # set predefined_sites_only to true
+    remove_other_sites: true                      # delete any site that isn't the one above
+
+    # ---- Microsoft 365 Apps for enterprise (ODT) ----
+    odt_src_path: "/mnt/c/Users/Vicky\ Deshpande/Downloads/Call\ Dumps/artefacts/officedeploymenttool_18925-20138.exe"
+    odt_root: 'C:\Temp\ODT'
+    # Channel options: Current, MonthlyEnterprise, SemiAnnualEnterprise
+    m365_channel: 'Current'
+    m365_language: 'en-us'
+    # Example app selection – tweak as needed
+    m365_exclude_teams: true
+
+  tasks:
+    # ---------- Chocolatey-based installs (auto-bootstraps Chocolatey) ----------
+    - name: 7-Zip (Chocolatey)
+      chocolatey.chocolatey.win_chocolatey:
+        name: 7zip
+        state: present
+        version: "{{ seven_zip_version | default(omit) }}"
+      when: install_7zip | bool
+
+    - name: AnyDesk (Chocolatey)
+      chocolatey.chocolatey.win_chocolatey:
+        name: anydesk
+        state: present
+        version: "{{ anydesk_version | default(omit) }}"
+      when: install_anydesk | bool
+
+    - name: Google Chrome (robust install)
+      block:
+        - name: Google Chrome (Chocolatey, strict)
+          chocolatey.chocolatey.win_chocolatey:
+            name: googlechrome
+            state: present
+          register: chrome_choco
+          when: install_chrome | bool
+      rescue:
+       - name: Google Chrome (Chocolatey, ignore checksums — vendor updated binary)
+         chocolatey.chocolatey.win_chocolatey:
+            name: googlechrome
+            state: present
+            ignore_checksums: true
+         register: chrome_choco_ignore
+
+    - name: Adobe Acrobat Reader DC (Chocolatey)
+      chocolatey.chocolatey.win_chocolatey:
+        name: adobereader
+        state: present
+        version: "{{ adobereader_version | default(omit) }}"
+      when: install_adobe_reader | bool
+
+    # # ---------- Adobe Acrobat Pro (licensed; needs Admin Console package) ----------
+    # - name: Check if Acrobat Pro is installed
+    #   ansible.windows.win_stat:
+    #     path: "{{ acrobat_detect_path }}"
+    #   register: acro_stat
+    #   when: install_adobe_acrobat_pro | bool
+
+    # - name: Install Adobe Acrobat Pro silently (Admin Console package)
+    #   ansible.windows.win_command:
+    #     cmd: "{{ acrobat_setup_path }} {{ acrobat_setup_args }}"
+    #   args:
+    #     chdir: "{{ acrobat_setup_path | dirname }}"
+    #   when:
+    #     - install_adobe_acrobat_pro | bool
+    #     - not acro_stat.stat.exists
+    #   register: acrobat_install
+
+    # ---------- Check Point (you must point to the correct product) ----------
+    - name: Copy Check Point installer
+      ansible.windows.win_copy:
+        src: "{{ checkpoint_installer_local_path }}"
+        dest: "C:\\Temp\\CheckPoint.msi"
+      when: install_checkpoint | bool
+
+    - name: Install Check Point (MSI)
+      ansible.windows.win_package:
+        path: "C:\\Temp\\CheckPoint.msi"
+        product_id: "{{ checkpoint_product_id | default(omit) }}"
+        arguments: "{{ checkpoint_install_args }}"
+        state: present
+        creates_path: "{{ checkpoint_creates_path | default(omit) }}"
+      when: install_checkpoint | bool
+    
+    - name: Reboot the machine and wait for 60 seconds before continuing
+      ansible.windows.win_reboot:
+      when: install_checkpoint | bool
+
+    - name: Resolve client install paths (trac.exe, trac.defaults, service)
+      ansible.windows.win_powershell:
+        script: |
+          $candidates = @(
+            'C:\Program Files (x86)\CheckPoint\Endpoint Security\Endpoint Connect',
+            'C:\Program Files (x86)\CheckPoint\Endpoint Connect',
+            'C:\Program Files\CheckPoint\Endpoint Connect'
+          )
+          $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $found) { throw "Check Point client path not found" }
+
+          $tracDir = Join-Path $found 'trac'
+          $tracExe = Join-Path $tracDir 'trac.exe'
+          if (-not (Test-Path $tracExe)) {
+            # Some builds place trac.exe one level up
+            $tracExe = Join-Path $found 'trac.exe'
+          }
+          $defaults1 = Join-Path $found 'trac.defaults'
+          $defaults2 = Join-Path (Join-Path $found 'Endpoint Connect') 'trac.defaults'
+          $defaults  = @($defaults1,$defaults2) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          $svcName = 'TracSrvWrapper'
+
+          $Ansible.Result = [pscustomobject]@{
+            BasePath = $found
+            TracExe  = $tracExe
+            Defaults = $defaults
+            Service  = $svcName
+          }
+      register: cp_paths
+      changed_when: false
+      when: install_checkpoint | bool
+
+    - name: Stop VPN service
+      ansible.windows.win_service:
+        name: "{{ cp_paths.result.Service }}"
+        state: stopped
+      when: install_checkpoint | bool
+
+    - name: Remove any existing VPN sites not matching the desired one (registry-driven)
+      when: install_checkpoint | bool and remove_other_sites
+      ansible.windows.win_powershell:
+        script: |
+          param($TargetSite, $TracExe)
+          $ErrorActionPreference = 'Stop'
+          $roots = @(
+            'HKLM:\SOFTWARE\WOW6432Node\CheckPoint\TRAC\sites',
+            'HKLM:\SOFTWARE\CheckPoint\TRAC\sites'
+          )
+          $existing = @()
+          foreach ($r in $roots) {
+            if (Test-Path $r) {
+              Get-ChildItem -Path $r | ForEach-Object { $existing += $_.PSChildName }
+            }
+          }
+          $existing = $existing | Sort-Object -Unique
+          foreach ($s in $existing) {
+            if ($s -ne $TargetSite) {
+              & $TracExe delete -s $s | Out-Null
+            }
+          }
+          $Ansible.Result = $existing
+        parameters:
+          TargetSite: "{{ vpn_site_fqdn }}"
+          TracExe: "{{ cp_paths.result.TracExe }}"
+      register: deleted_sites
+      changed_when: >
+        (deleted_sites.result | default([])) | select('ne', vpn_site_fqdn) | list | length > 0
+
+    - name: Create the single allowed site (idempotent)
+      ansible.windows.win_powershell:
+        script: |
+          param($TracExe, $Site, $Display, $LoginOpt, $Auth, $Fp)
+          $args = @('create','-s', $Site)
+          if ($Display) { $args += @('-di', $Display) }
+          if ($LoginOpt) { $args += @('-lo', $LoginOpt) }
+          if ($Auth)     { $args += @('-a',  $Auth) }
+          if ($Fp)       { $args += @('-f',  $Fp) }
+          & $TracExe @args | Out-Null
+        parameters:
+          TracExe:  "{{ cp_paths.result.TracExe }}"
+          Site:     "{{ vpn_site_fqdn }}"
+          Display:  "{{ vpn_site_display }}"
+          LoginOpt: "{{ vpn_login_option }}"
+          Auth:     "{{ vpn_auth_method }}"
+          Fp:       "{{ vpn_rootca_fingerprint }}"
+      changed_when: false
+      when: install_checkpoint | bool
+
+    - name: Optionally cache user credentials for the site (if provided)
+      when: install_checkpoint | bool and vpn_username | length > 0 and vpn_password | length > 0
+      ansible.windows.win_powershell:
+        script: |
+          param($TracExe, $Site, $User, $Pass)
+          & $TracExe userpass -s $Site -u $User -p $Pass | Out-Null
+        parameters:
+          TracExe: "{{ cp_paths.result.TracExe }}"
+          Site:    "{{ vpn_site_display | default(vpn_site_fqdn) }}"
+          User:    "{{ vpn_username }}"
+          Pass:    "{{ vpn_password }}"
+      changed_when: false
+
+    - name: Enforce 'predefined_sites_only' (lock UI/CLI to predefined sites)
+      when: install_checkpoint | bool and lock_sites and (cp_paths.result.Defaults | length > 0)
+      ansible.windows.win_powershell:
+        script: |
+          param($DefaultsPath)
+          if (-not (Test-Path $DefaultsPath)) { return }
+          $raw = Get-Content -Path $DefaultsPath -Raw
+          if ($raw -match '(?im)^\s*predefined_sites_only\b') {
+            $raw = [regex]::Replace(
+              $raw,
+              '(?im)^(?<pfx>\s*predefined_sites_only\s+\w+\s+)(?<val>true|false|0|1)(?<sfx>.*)$',
+              '${pfx}true${sfx}'
+            )
+          } else {
+            $raw += "`r`npredefined_sites_only STRING true GW_USER 0`r`n"
+          }
+          Set-Content -Path $DefaultsPath -Value $raw -Encoding ASCII
+        parameters:
+          DefaultsPath: "{{ cp_paths.result.Defaults }}"
+      changed_when: true
+
+    - name: Start VPN service
+      ansible.windows.win_service:
+        name: "{{ cp_paths.result.Service }}"
+        state: started
+      when: install_checkpoint | bool
+
+    - name: Assert only the desired site exists
+      ansible.windows.win_powershell:
+        script: |
+          param($TargetSite)
+          $roots = @(
+            'HKLM:\SOFTWARE\WOW6432Node\CheckPoint\TRAC\sites',
+            'HKLM:\SOFTWARE\CheckPoint\TRAC\sites'
+          )
+          $sites = @()
+          foreach ($r in $roots) {
+            if (Test-Path $r) {
+              $sites += (Get-ChildItem -Path $r | Select-Object -Expand PSChildName)
+            }
+          }
+          $sites = $sites | Sort-Object -Unique
+          $Ansible.Result = [pscustomobject]@{
+            Sites = $sites
+            OnlyDesired = ($sites.Count -eq 1 -and $sites[0] -eq $TargetSite)
+          }
+        parameters:
+          TargetSite: "{{ vpn_site_fqdn }}"
+      register: site_check
+      changed_when: false
+      when: install_checkpoint | bool
+
+
+    # ---------- Microsoft 365 Apps for enterprise via ODT ----------
+    - name: Check if Word exists (idempotency gate)
+      ansible.windows.win_stat:
+        path: "C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE"
+      register: word_exe
+      when: install_m365_apps | bool
+
+    - name: Ensure ODT folder exists
+      ansible.windows.win_file:
+        path: "{{ odt_root }}"
+        state: directory
+      when:
+        - install_m365_apps | bool
+        - not word_exe.stat.exists
+
+    - name: Copy Office Deployment Tool
+      ansible.windows.win_copy:
+        src: "{{ odt_src_path }}"
+        dest: "{{ odt_root }}\\odt.exe"
+      when:
+        - install_m365_apps | bool
+        - not word_exe.stat.exists
+
+    - name: Extract ODT
+      ansible.windows.win_command:
+        cmd: "{{ odt_root }}\\odt.exe /quiet /extract:{{ odt_root }}"
+      when:
+        - install_m365_apps | bool
+        - not word_exe.stat.exists
+
+    - name: Write ODT configuration.xml
+      ansible.windows.win_copy:
+        dest: "{{ odt_root }}\\configuration.xml"
+        content: |
+          <Configuration>
+            <Add OfficeClientEdition="64" Channel="{{ m365_channel }}">
+              <Product ID="O365ProPlusRetail">
+                <Language ID="{{ m365_language }}"/>
+                {% if m365_exclude_teams %}<ExcludeApp ID="Teams"/>{% endif %}
+              </Product>
+            </Add>
+            <Display Level="None" AcceptEULA="TRUE"/>
+            <Property Name="AUTOACTIVATE" Value="1"/>
+            <Updates Enabled="TRUE"/>
+          </Configuration>
+      when:
+        - install_m365_apps | bool
+        - not word_exe.stat.exists
+
+    - name: Pre-download M365 media (optional but recommended)
+      ansible.windows.win_command:
+        cmd: "{{ odt_root }}\\setup.exe /download {{ odt_root }}\\configuration.xml"
+      when:
+        - install_m365_apps | bool
+        - not word_exe.stat.exists
+
+    - name: Install/Configure M365
+      ansible.windows.win_command:
+        cmd: "{{ odt_root }}\\setup.exe /configure {{ odt_root }}\\configuration.xml"
+      when:
+        - install_m365_apps | bool
+        - not word_exe.stat.exists

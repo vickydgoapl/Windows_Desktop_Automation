@@ -1,0 +1,14 @@
+# --- settings ---
+$User = 'ansible-admin'
+
+# Create the user if missing and make it a local admin
+if (-not (Get-LocalUser -Name $User -ErrorAction SilentlyContinue)) {
+  $Pass = Read-Host -AsSecureString "Set a strong password for $User"
+  New-LocalUser -Name $User -Password $Pass -PasswordNeverExpires | Out-Null
+}
+Add-LocalGroupMember -Group 'Administrators' -Member $User -ErrorAction SilentlyContinue
+Add-LocalGroupMember -Group 'Remote Management Users' -Member $User -ErrorAction SilentlyContinue
+
+# Keep local admins "admin" over WinRM (disable UAC remote filtering)
+reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System `
+  /v LocalAccountTokenFilterPolicy /t REG_DWORD /d 1 /f | Out-Null

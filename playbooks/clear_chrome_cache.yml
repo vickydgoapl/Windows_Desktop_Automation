@@ -1,0 +1,113 @@
+---
+- name: Clear Google Chrome browser cache on Windows
+  hosts: windows_desktops
+  gather_facts: yes
+
+  # === knobs you can tweak ===
+  vars:
+    wipe_all_users: false          # set true to clear every local profile
+    kill_chrome_first: true        # stop chrome so files aren't locked
+    clear_service_worker_cache: true
+    also_clear_cookies: false      # leave false unless you really want to sign everyone out
+
+  collections:
+    - ansible.windows
+
+  pre_tasks:
+    - name: Stop Chrome if running (optional but recommended)
+      ansible.windows.win_shell: |
+        if (Get-Process chrome -ErrorAction SilentlyContinue) {
+          Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -PassThru | Out-Null
+        }
+      when: kill_chrome_first | bool
+
+  tasks:
+    - name: Clear Chrome caches (current user or all users)
+      ansible.windows.win_powershell:
+        script: |
+          # input flags from Ansible
+          $AllUsers   = [bool]::Parse('{{ wipe_all_users | string | lower }}')
+          $ClearSW    = [bool]::Parse('{{ clear_service_worker_cache | string | lower }}')
+          $ClearCookies = [bool]::Parse('{{ also_clear_cookies | string | lower }}')
+
+          # Build list of Chrome "User Data" roots to clean
+          $roots = @()
+          if (-not $AllUsers) {
+            $root = Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data'
+            if (Test-Path $root) { $roots += $root }
+          } else {
+            Get-ChildItem -Path 'C:\Users' -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+              $p = Join-Path $_.FullName 'AppData\Local\Google\Chrome\User Data'
+              if (Test-Path $p) { $roots += $p }
+            }
+          }
+
+          # What to clear per profile
+          $targetDirs = @(
+            'Cache',                         # legacy + current disk cache
+            'Cache\Cache_Data',              # newer network cache layout
+            'Code Cache',                    # compiled JS/WASM
+            'GPUCache',                      # GPU cache
+            'Media Cache',                   # media buffers
+            'DawnCache', 'ShaderCache', 'GrShaderCache'  # graphics caches
+          )
+
+          # Also clear Network\Cache (present on newer builds)
+          $extraDirNames = @('Network\Cache')
+
+          # Optional: Service Worker CacheStorage (site offline caches)
+          if ($ClearSW) { $extraDirNames += 'Service Worker\CacheStorage' }
+
+          # Optional: cookies (WARNING: session/logout impact)
+          $cookieFiles = @('Network\Cookies','Cookies')
+
+          $removed = @()
+          $errors  = @()
+
+          foreach ($root in $roots) {
+            # Profiles are "Default", "Profile X", "Guest Profile"
+            $profiles = Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -match '^(Default|Profile \d+|Guest Profile)$' }
+
+            foreach ($prof in $profiles) {
+              foreach ($dir in $targetDirs) {
+                $path = Join-Path $prof.FullName $dir
+                if (Test-Path $path) {
+                  try { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop; $removed += $path } catch { $errors += "$path :: $($_.Exception.Message)" }
+                }
+              }
+              foreach ($dir in $extraDirNames) {
+                $path = Join-Path $prof.FullName $dir
+                if (Test-Path $path) {
+                  try { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop; $removed += $path } catch { $errors += "$path :: $($_.Exception.Message)" }
+                }
+              }
+              if ($ClearCookies) {
+                foreach ($cookie in $cookieFiles) {
+                  $cpath = Join-Path $prof.FullName $cookie
+                  if (Test-Path $cpath) {
+                    try { Remove-Item -LiteralPath $cpath -Force -ErrorAction Stop; $removed += $cpath } catch { $errors += "$cpath :: $($_.Exception.Message)" }
+                  }
+                }
+              }
+            }
+          }
+
+          [pscustomobject]@{
+            roots = $roots
+            removed = $removed
+            removedCount = $removed.Count
+            errors = $errors
+          } | ConvertTo-Json -Compress
+      register: chrome_cleanup
+      changed_when: >
+        (chrome_cleanup.stdout is defined)
+        and ((chrome_cleanup.stdout | from_json).removedCount | int) > 0
+
+    - name: Report what was cleared
+      ansible.builtin.debug:
+        msg:
+          - "Chrome roots checked: {{ (chrome_cleanup.stdout | from_json).roots | default([]) }}"
+          - "Items removed ({{ (chrome_cleanup.stdout | from_json).removedCount | default(0) }}):"
+          - "{{ (chrome_cleanup.stdout | from_json).removed | default([]) }}"
+          - "Errors (if any): {{ (chrome_cleanup.stdout | from_json).errors | default([]) }}"

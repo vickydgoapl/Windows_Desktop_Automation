@@ -1,0 +1,29 @@
+# Enable PowerShell remoting / WinRM service
+Enable-PSRemoting -SkipNetworkProfileCheck -Force
+
+# Prefer HTTPS for auth like Basic/Negotiate; create or reuse a self‑signed cert
+$dns = try { ([System.Net.Dns]::GetHostByName($env:COMPUTERNAME)).HostName } catch { $null }
+$names = @($env:COMPUTERNAME) + @(if ($dns -and $dns -ne $env:COMPUTERNAME) { $dns } else { @() })
+$cert = Get-ChildItem Cert:\LocalMachine\My |
+        Where-Object { $_.Subject -match "CN=$($env:COMPUTERNAME)\b" } |
+        Sort-Object NotAfter -Descending | Select-Object -First 1
+if (-not $cert) {
+  $cert = New-SelfSignedCertificate -DnsName $names -CertStoreLocation Cert:\LocalMachine\My
+}
+
+# Recreate HTTPS listener cleanly
+winrm delete winrm/config/Listener?Address=*+Transport=HTTPS 2>$null | Out-Null
+$thumb = $cert.Thumbprint
+$hn    = $env:COMPUTERNAME
+winrm create winrm/config/Listener?Address=*+Transport=HTTPS "@{Hostname=`"$hn`";CertificateThumbprint=`"$thumb`"}" | Out-Null
+
+# Auth knobs (use what your environment supports)
+Set-Item WSMan:\localhost\Service\Auth\Basic $true        # for local/workgroup over HTTPS
+Set-Item WSMan:\localhost\Service\Auth\Negotiate $true    # NTLM/Kerberos over HTTP/HTTPS
+# (Optional) Kerberos (domain‑joined boxes)
+Set-Item WSMan:\localhost\Service\Auth\Kerberos $true
+
+# Do NOT allow plaintext; Ansible can do HTTPS easily
+Set-Item WSMan:\localhost\Service\AllowUnencrypted $false
+
+Restart-Service WinRM

@@ -1,0 +1,55 @@
+---
+# laptop_housekeeping.yml
+# Purpose: General Windows endpoint housekeeping
+# Author : <you>
+
+- name: Windows laptop / desktop housekeeping
+  hosts: windows_desktops
+  gather_facts: no               # WinRM already gives us enough
+  vars:
+    excluded_profiles:
+      - 'All Users'
+      - 'Default'
+      - 'Default User'
+      - 'Public'
+  collections:
+    - community.windows
+    - ansible.windows
+    - chocolatey.chocolatey
+
+  #################################################################
+  # Discover every real user profile once, then re‑use the list
+  #################################################################
+  pre_tasks:
+    - name: find who i am
+      ansible.windows.win_powershell: 
+        script: whoami
+      register: whoami
+
+    - debug:
+        msg: "{{ whoami }}"
+
+
+  #################################################################
+  # 1.   SYSTEM‑WIDE TEMP & PATCH‑CACHE FOLDERS
+  #################################################################
+  tasks:
+    - name: Ensure Chocolatey is present (idempotent)
+      win_chocolatey:
+        name: chocolatey
+        state: present
+
+    - name: Install Notepad++
+      win_chocolatey:
+        name: notepadplusplus
+        state: present
+
+    - name: Confirm Notepad++ installed
+      ansible.windows.win_stat:
+        path: 'C:\Program Files\Notepad++\notepad++.exe'
+      register: npp
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "Notepad++ installed."
+      when: npp.stat.exists

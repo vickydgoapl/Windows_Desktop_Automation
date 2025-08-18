@@ -1,0 +1,345 @@
+---
+- name: Windows health + essential services monitor (robust)
+  hosts: windows_desktops
+  gather_facts: no
+
+  collections:
+    - ansible.windows
+
+  vars:
+    # --- Thresholds ---
+    cpu_warn_pct: 85               # warn if avg CPU load ≥ this
+    mem_free_warn_pct: 15          # warn if free RAM % ≤ this
+    disk_free_warn_pct: 10         # warn if any volume free % ≤ this
+
+    # --- Security baselines to enforce/alert on ---
+    firewall_required: true
+    defender_required: true
+    bitlocker_required: false
+
+    # --- Behavior knobs ---
+    fail_on_critical: false        # set true to make the play fail on criticals
+    write_report_to: "reports/windows_health_{{ inventory_hostname }}.json"
+
+    # --- Essential services (service names, not display names) ---
+    essential_services:
+      - { name: "WinRM",               want_status: "Running", want_start: "Auto", required: true }
+      - { name: "MpsSvc",              want_status: "Running", want_start: "Auto", required: true }   # Windows Firewall
+      - { name: "WinDefend",           want_status: "Running", want_start: "Auto", required: true }   # Defender AV
+      - { name: "EventLog",            want_status: "Running", want_start: "Auto", required: true }
+      - { name: "Dnscache",            want_status: "Running", want_start: "Auto", required: true }   # DNS Client
+      - { name: "Dhcp",                want_status: "Running", want_start: "Auto", required: true }   # DHCP Client
+      - { name: "LanmanWorkstation",   want_status: "Running", want_start: "Auto", required: true }   # Workstation
+      - { name: "Schedule",            want_status: "Running", want_start: "Auto", required: true }   # Task Scheduler
+      - { name: "wscsvc",              want_status: "Running", want_start: "Auto", required: false }  # Security Center
+      - { name: "W32Time",             want_status: "Running", want_start: "Auto", required: false }  # Windows Time
+      - { name: "Spooler",           want_status: "Running", want_start: "Auto", required: true  }   # Print Spooler ✅
+
+  tasks:
+    # -------- Collect metrics (structured) --------
+    - name: Collect device health metrics (CPU, RAM, disks, firewall, defender, bitlocker, pending reboot, uptime)
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+
+          # CPU
+          $cpuAvg = (Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average
+          if ($null -eq $cpuAvg) { $cpuAvg = 0 }
+
+          # Memory
+          $os = Get-CimInstance Win32_OperatingSystem
+          $totalKB = [int64]$os.TotalVisibleMemorySize
+          $freeKB  = [int64]$os.FreePhysicalMemory
+          $memFreePct = if ($totalKB -gt 0) { [math]::Round(($freeKB / $totalKB) * 100, 1) } else { 0 }
+
+          # Disks
+          $vols = @()
+          try {
+            $vols = Get-Volume -ErrorAction Stop | Where-Object DriveLetter | ForEach-Object {
+              [pscustomobject]@{
+                DriveLetter = $_.DriveLetter
+                Label       = $_.FileSystemLabel
+                SizeGB      = [math]::Round($_.Size/1GB,1)
+                FreeGB      = [math]::Round($_.SizeRemaining/1GB,1)
+                FreePct     = if ($_.Size -gt 0) { [math]::Round( ($_.SizeRemaining / $_.Size) * 100, 1) } else { 0 }
+              }
+            }
+          } catch {
+            $vols = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | ForEach-Object {
+              [pscustomobject]@{
+                DriveLetter = ($_.DeviceID -replace ':$','')
+                Label       = $_.VolumeName
+                SizeGB      = [math]::Round($_.Size/1GB,1)
+                FreeGB      = [math]::Round($_.FreeSpace/1GB,1)
+                FreePct     = if ($_.Size -gt 0) { [math]::Round( ($_.FreeSpace / $_.Size) * 100, 1) } else { 0 }
+              }
+            }
+          }
+
+          # Firewall
+          $fw = $null; $fwAllEnabled = $null
+          try {
+            $fw = Get-NetFirewallProfile -ErrorAction Stop | Select-Object Name, Enabled
+            $fwAllEnabled = -not ($fw | Where-Object { -not $_.Enabled })
+          } catch {}
+
+          # Defender
+          $defenderRTP = $null
+          try { $defenderRTP = (Get-MpComputerStatus -ErrorAction Stop).RealTimeProtectionEnabled } catch {}
+
+          # BitLocker
+          $bitlocker = $null
+          $bitlockerProtectedAll = $null
+          try {
+            if (Get-Command Get-BitLockerVolume -ErrorAction Stop) {
+              $bitlocker = Get-BitLockerVolume | Select-Object MountPoint, ProtectionStatus
+              if ($bitlocker) {
+                $bitlockerProtectedAll = -not ($bitlocker | Where-Object { $_.MountPoint -match '^[A-Z]:' -and $_.ProtectionStatus -ne 1 })
+              }
+            }
+          } catch {}
+
+          # Pending reboot
+          $pending = $false
+          $paths = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+          )
+          foreach ($p in $paths) { if (Test-Path $p) { $pending = $true } }
+          try {
+            $pfro = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction Stop
+            if ($pfro) { $pending = $true }
+          } catch {}
+
+          # Uptime (robust across CIM/WMI quirks)
+          $boot = $null
+          $bootRaw = $os.LastBootUpTime
+          if ($bootRaw -is [datetime]) {
+            $boot = $bootRaw
+          } elseif ($bootRaw) {
+            try { $boot = [Management.ManagementDateTimeConverter]::ToDateTime([string]$bootRaw) } catch {}
+          }
+          if (-not $boot) {
+            try {
+              $sec = (Get-CimInstance Win32_PerfFormattedData_PerfOS_System).SystemUpTime
+              if ($sec) { $boot = (Get-Date).AddSeconds(- [double]$sec) }
+            } catch {}
+          }
+          if (-not $boot) {
+            try { $boot = (Get-WinEvent -FilterHashtable @{LogName='System'; Id=6005} -MaxEvents 1).TimeCreated } catch {}
+          }
+          if (-not $boot) { $boot = Get-Date }
+
+          $uptimeSec = [int]((Get-Date) - $boot).TotalSeconds
+          $ts = New-TimeSpan -Seconds $uptimeSec
+          $uptimeHuman = '{0}d {1}h {2}m {3}s' -f $ts.Days,$ts.Hours,$ts.Minutes,$ts.Seconds
+
+          $Ansible.Result = [pscustomobject]@{
+            cpuAvg                = [int]$cpuAvg
+            memFreePct            = $memFreePct
+            disks                 = $vols
+            firewall              = $fw
+            firewallAllEnabled    = $fwAllEnabled
+            defenderRTP           = $defenderRTP
+            bitlocker             = $bitlocker
+            bitlockerProtectedAll = $bitlockerProtectedAll
+            pendingReboot         = $pending
+            lastBoot              = $boot
+            uptimeSeconds         = $uptimeSec
+            uptimeHuman           = $uptimeHuman
+          }
+      register: health_raw
+      changed_when: false
+
+    - name: Parse metrics (structured)
+      ansible.builtin.set_fact:
+        health: "{{ health_raw.result | default({}, true) }}"
+      changed_when: false
+
+    - name: Normalize health values for alerting/summary
+      ansible.builtin.set_fact:
+        h_cpu:                      "{{ health.get('cpuAvg', 0) | int }}"
+        h_mem_free_pct:             "{{ health.get('memFreePct', 100) | float }}"
+        h_firewall_all_enabled:     "{{ health.get('firewallAllEnabled', none) }}"
+        h_defender_rtp:             "{{ health.get('defenderRTP', none) }}"
+        h_bitlocker_all_protected:  "{{ health.get('bitlockerProtectedAll', none) }}"
+        h_pending_reboot:           "{{ health.get('pendingReboot', false) | bool }}"
+        h_uptime_sec:               "{{ health.get('uptimeSeconds', 0) | int }}"
+        h_uptime_human:             "{{ health.get('uptimeHuman', '') }}"
+      changed_when: false
+
+    # -------- Normalize disks (split across tasks; no self-references) --------
+    - name: Disks stage 1 — grab raw
+      ansible.builtin.set_fact:
+        h_disks_raw: "{{ health.get('disks', []) }}"
+      changed_when: false
+
+    - name: Disks stage 2 — coerce into a list
+      ansible.builtin.set_fact:
+        h_disks_list: >-
+          {{
+            [] if (h_disks_raw is string)
+            else ([h_disks_raw] if (h_disks_raw is mapping)
+            else (h_disks_raw | default([], true)))
+          }}
+      changed_when: false
+
+    - name: Disks stage 3 — keep only dict-like items (must have DriveLetter)
+      ansible.builtin.set_fact:
+        disks_mapped: "{{ h_disks_list | selectattr('DriveLetter','defined') | list }}"
+      changed_when: false
+
+    - name: Disks stage 4 — build display lists
+      ansible.builtin.set_fact:
+        disk_letters: "{{ disks_mapped | map(attribute='DriveLetter') | list }}"
+      changed_when: false
+
+    # -------- Services compliance --------
+    - name: Check essential services state and start mode
+      ansible.windows.win_powershell:
+        script: |
+          $desired = ConvertFrom-Json @'
+          {{ essential_services | to_json }}
+          '@
+
+          $results = @()
+          foreach ($svc in $desired) {
+            $name = [string]$svc.name
+            $wantStatus = [string]$svc.want_status
+            $wantStart  = [string]$svc.want_start
+            $required   = [bool]$svc.required
+
+            $g = Get-Service -Name $name -ErrorAction SilentlyContinue
+            if (-not $g) {
+              $results += [pscustomobject]@{
+                Name        = $name
+                Exists      = $false
+                Status      = $null
+                StartMode   = $null
+                Required    = $required
+                Compliant   = $false
+                Reason      = 'Service not found'
+              }
+              continue
+            }
+
+            $wmi = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $name) -ErrorAction SilentlyContinue
+            $startMode = if ($wmi) { $wmi.StartMode } else { $null }  # 'Auto','Manual','Disabled'
+            $wantStartNorm = if ($wantStart -match '^auto') { 'Auto' } elseif ($wantStart -match '^manual') { 'Manual' } elseif ($wantStart -match '^disable') { 'Disabled' } else { $wantStart }
+            $startOk  = ($startMode -ne $null) -and ($startMode -ieq $wantStartNorm)
+            $statusOk = ($g.Status.ToString() -ieq $wantStatus)
+
+            $ok = $statusOk -and $startOk
+            $reason = @()
+            if (-not $statusOk) { $reason += ("status={0}" -f $g.Status) }
+            if (-not $startOk)  { $reason += ("start={0}"  -f $startMode) }
+
+            $results += [pscustomobject]@{
+              Name      = $name
+              Exists    = $true
+              Status    = $g.Status.ToString()
+              StartMode = $startMode
+              Required  = $required
+              Compliant = $ok
+              Reason    = ($reason -join '; ')
+            }
+          }
+
+          $Ansible.Result = $results
+      register: services_raw
+      changed_when: false
+
+    - name: Parse services (structured)
+      ansible.builtin.set_fact:
+        services: "{{ services_raw.result | default([]) }}"
+      changed_when: false
+
+    - name: Compute low-disk list once
+      ansible.builtin.set_fact:
+        low_disks: >-
+          {{
+            disks_mapped
+            | selectattr('FreePct', 'defined')
+            | selectattr('FreePct', 'le', disk_free_warn_pct | float)
+            | map(attribute='DriveLetter')
+            | list
+          }}
+      changed_when: false
+
+    - name: Build alerts/warnings based on thresholds and services
+      ansible.builtin.set_fact:
+        alerts: >-
+          {{
+            []
+            + ( ['Pending reboot'] if h_pending_reboot else [] )
+            + ( ['CPU high: ' ~ h_cpu ~ '%'] if (h_cpu >= (cpu_warn_pct | int)) else [] )
+            + ( ['Memory low: ' ~ (100 - (h_mem_free_pct | int)) ~ '% used'] if (h_mem_free_pct <= (mem_free_warn_pct | float)) else [] )
+            + ( low_disks | map('regex_replace', '(.*)', 'Low disk free on drive \\1') | list )
+            + ( ['Firewall disabled on one or more profiles']
+                if (firewall_required and (h_firewall_all_enabled is not boolean or not h_firewall_all_enabled)) else [] )
+            + ( ['Defender RTP disabled or unavailable']
+                if (defender_required and (h_defender_rtp is not boolean or not h_defender_rtp)) else [] )
+            + ( ['BitLocker not fully protected']
+                if (bitlocker_required and (h_bitlocker_all_protected is not boolean or not h_bitlocker_all_protected)) else [] )
+          }}
+        service_criticals: "{{ services | selectattr('Required','eq',true)  | selectattr('Compliant','eq',false) | list }}"
+        service_warnings:  "{{ services | selectattr('Required','eq',false) | selectattr('Compliant','eq',false) | list }}"
+      changed_when: false
+
+    - name: Summarize device health
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Uptime: {{ h_uptime_human if (h_uptime_human | length) > 0 else (h_uptime_sec ~ 's') }} (boot: {{ health.get('lastBoot','unknown') }})"
+          - "CPU avg: {{ h_cpu }}% | Free RAM: {{ h_mem_free_pct }}%"
+          - "Disks: {{ (disk_letters | default([])) | join(', ') }}"
+          - "Firewall all enabled: {{ h_firewall_all_enabled | default('unknown') }}"
+          - "Defender RTP: {{ h_defender_rtp | default('unknown') }}"
+          - "BitLocker all protected: {{ h_bitlocker_all_protected | default('unknown') }}"
+          - "Pending reboot: {{ h_pending_reboot }}"
+          - "Service issues (critical): {{ service_criticals | length }} | (warning): {{ service_warnings | length }}"
+          - "Alerts: {{ alerts | default([]) }}"
+      changed_when: false
+
+    # -------- Report artifact on controller --------
+    - name: Ensure report directory exists on the controller
+      ansible.builtin.file:
+        path: "{{ write_report_to | dirname }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      run_once: false
+      when: write_report_to | default('', true) | length > 0
+
+    - name: Compute ISO timestamp on the controller
+      ansible.builtin.set_fact:
+        report_ts: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+      delegate_to: localhost
+      run_once: false
+      when: write_report_to | default('', true) | length > 0
+
+    - name: Optionally write JSON report on controller
+      ansible.builtin.copy:
+        content: |
+          {
+            "host": "{{ inventory_hostname }}",
+            "timestamp": "{{ report_ts | default('') }}",
+            "health": {{ health | to_json }},
+            "services": {{ services | to_json }},
+            "alerts": {{ alerts | default([]) | to_json }},
+            "service_criticals": {{ service_criticals | to_json }},
+            "service_warnings": {{ service_warnings | to_json }}
+          }
+        dest: "{{ write_report_to }}"
+        mode: "0644"
+      delegate_to: localhost
+      run_once: false
+      when: write_report_to | default('', true) | length > 0
+
+    - name: Fail if critical issues and enforcement enabled
+      ansible.builtin.fail:
+        msg: >
+          Critical health issues detected on {{ inventory_hostname }}:
+          {{ (alerts | list) + (service_criticals | map(attribute='Name') | list) }}
+      when: fail_on_critical | bool and ((alerts | length) > 0 or (service_criticals | length) > 0)
+      changed_when: false

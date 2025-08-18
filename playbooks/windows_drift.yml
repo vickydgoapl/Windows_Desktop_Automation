@@ -1,0 +1,398 @@
+---
+- name: Windows desktop drift --- identify → isolate → rectify (Private-only firewall)
+  hosts: windows_desktops
+  gather_facts: no
+
+  collections:
+    - ansible.windows
+    - community.windows
+    - chocolatey.chocolatey
+
+  vars:
+    # === Mode ===
+    drift_mode: report              # report | enforce
+    drift_report_path: "reports/drift_{{ inventory_hostname }}.json"
+
+    # === Baseline ===
+    baseline:
+      services:
+        - { name: "WinRM",             start: "Auto", state: "Running", required: true }
+        - { name: "MpsSvc",            start: "Auto", state: "Running", required: true }   # Windows Firewall
+        - { name: "WinDefend",         start: "Auto", state: "Running", required: true }   # Defender AV
+        - { name: "EventLog",          start: "Auto", state: "Running", required: true }
+        - { name: "Dnscache",          start: "Auto", state: "Running", required: true }
+        - { name: "Dhcp",              start: "Auto", state: "Running", required: true }
+        - { name: "LanmanWorkstation", start: "Auto", state: "Running", required: true }
+        - { name: "Schedule",          start: "Auto", state: "Running", required: true }
+        - { name: "W32Time",           start: "Auto", state: "Running", required: false }
+        - { name: "Spooler",           start: "Auto", state: "Running", required: false }  # Print Spooler (monitor by default)
+
+      firewall:
+        desired_enabled:
+          Domain:  false
+          Private: true
+          Public:  false
+
+      local_admins:
+        group: "Administrators"
+        enforce_pure: false
+        members:
+          - "BUILTIN\\Administrators"
+          - "NT AUTHORITY\\SYSTEM"
+          # - "{{ ansible_env.USERDOMAIN | default('') }}\\ansible-admin"  # add your managed admin here
+
+      registry:
+        - { path: 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System',
+            name: 'LocalAccountTokenFilterPolicy', type: 'dword', data: 1 }
+
+      software:
+        required:
+          - { display: "Google Chrome", choco: "googlechrome" }
+          - { display: "7-Zip",         choco: "7zip" }
+        banned:
+          # Detect-only example
+          - { regex: "(?i)uTorrent|Toolbar" }
+
+
+
+  tasks:
+    # -------------------------------------------------------------------------
+
+    # -------------------------------------------------------------------------
+    - name: Collect observed state (services, firewall, admins, software)
+      ansible.windows.win_powershell:
+        script: |
+          param($ServiceNames)
+          $ErrorActionPreference = 'Stop'
+
+          # Services (status + start mode)
+          $svcRes = @()
+          foreach ($n in $ServiceNames) {
+            $s = Get-Service -Name $n -ErrorAction SilentlyContinue
+            $wmi = $null; if ($s) { try { $wmi = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $n) } catch {} }
+            $svcRes += [pscustomobject]@{
+              Name      = $n
+              Exists    = [bool]$s
+              Status    = if ($s) { $s.Status.ToString() } else { $null }
+              StartMode = if ($wmi) { $wmi.StartMode } else { $null }  # Auto | Manual | Disabled
+            }
+          }
+
+          # Firewall profiles
+          $fw = $null; $fwAll = $null
+          try {
+            $fw = Get-NetFirewallProfile -ErrorAction Stop | Select-Object Name, Enabled
+            $fwAll = -not ($fw | Where-Object { -not $_.Enabled })
+          } catch {}
+
+          # Local Administrators members
+          $admins = @()
+          try {
+            $admins = Get-LocalGroupMember -Group 'Administrators' | Select-Object -Expand Name
+          } catch {
+            try { $admins = (net localgroup administrators) 2>$null | Where-Object { $_ -match '^[^*]+' } } catch {}
+          }
+
+          # Installed apps
+          $apps = @()
+          $roots = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+          )
+          foreach ($r in $roots) {
+            if (Test-Path $r) {
+              Get-ChildItem $r | ForEach-Object {
+                $p = Get-ItemProperty -Path $_.PsPath -ErrorAction SilentlyContinue
+                if ($p.DisplayName) {
+                  $prodId = $null
+                  if ($p.PSChildName -match '^\{[0-9A-Fa-f\-]+\}$' -and $p.WindowsInstaller -eq 1) { $prodId = $p.PSChildName }
+                  $apps += [pscustomobject]@{
+                    DisplayName     = $p.DisplayName
+                    DisplayVersion  = $p.DisplayVersion
+                    Publisher       = $p.Publisher
+                    UninstallString = $p.UninstallString
+                    ProductId       = $prodId
+                  }
+                }
+              }
+            }
+          }
+
+          $Ansible.Result = [pscustomobject]@{
+            Services            = $svcRes
+            Firewall            = $fw
+            FirewallAllEnabled  = $fwAll
+            LocalAdmins         = $admins
+            InstalledApps       = $apps
+          }
+        arguments:
+          ServiceNames: "{{ baseline.services | map(attribute='name') | list }}"
+      register: observed_raw
+      changed_when: false
+
+    - name: Normalize observed state
+      ansible.builtin.set_fact:
+        observed:   "{{ observed_raw.result | default({}, true) }}"
+        o_services: "{{ observed_raw.result.Services | default([], true) }}"
+        o_fw_list:  "{{ observed_raw.result.Firewall | default([], true) }}"
+        o_fw_all:   "{{ observed_raw.result.FirewallAllEnabled | default(none, true) }}"
+        o_admins:   "{{ observed_raw.result.LocalAdmins | default([], true) }}"
+        o_apps:     "{{ observed_raw.result.InstalledApps | default([], true) }}"
+      changed_when: false
+
+    - name: Get registry value state for baseline keys
+      ansible.windows.win_reg_stat:
+        path: "{{ item.path }}"
+        name: "{{ item.name }}"
+      loop: "{{ baseline.registry }}"
+      register: reg_stats
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+
+    # -------------------------------------------------------------------------
+
+    # Services drift
+    - name: Init services drift
+      ansible.builtin.set_fact:
+        drift_services: []
+      changed_when: false
+
+    - name: Compute services drift
+      ansible.builtin.set_fact:
+        drift_services: "{{ drift_services + [ {
+          'name': item.name,
+          'want_start': item.start,
+          'want_state': item.state,
+          'required': item.required | bool,
+          'exists': ((o_services | selectattr('Name','equalto', item.name) | list | length) > 0),
+          'start_mode': ((o_services | selectattr('Name','equalto', item.name) | map(attribute='StartMode') | list | first) | default('')),
+          'status': ((o_services | selectattr('Name','equalto', item.name) | map(attribute='Status') | list | first) | default('')),
+          'start_drift': ( ((o_services | selectattr('Name','equalto', item.name) | map(attribute='StartMode') | list | first) | default('') | lower) != (item.start | string | lower) ),
+          'state_drift': ( ((o_services | selectattr('Name','equalto', item.name) | map(attribute='Status') | list | first) | default('') | lower) != (item.state | string | lower) )
+        } ] }}"
+      loop: "{{ baseline.services }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
+    # Firewall drift (per profile)
+    - name: Init firewall drift list
+      ansible.builtin.set_fact:
+        drift_fw_list: []
+      changed_when: false
+
+    - name: Build firewall drift entries
+      ansible.builtin.set_fact:
+        drift_fw_list: "{{ drift_fw_list + [ {
+          'profile': item,
+          'want_enabled': (baseline.firewall.desired_enabled[item] | default(false)),
+          'is_enabled': ((o_fw_list | selectattr('Name','equalto', item) | map(attribute='Enabled') | list | first) | default(none)),
+          'drift': ((baseline.firewall.desired_enabled[item] | default(false)) != ((o_fw_list | selectattr('Name','equalto', item) | map(attribute='Enabled') | list | first) | default(false)))
+        } ] }}"
+      loop:
+        - Domain
+        - Private
+        - Public
+      changed_when: false
+
+    - name: Save firewall drift object
+      ansible.builtin.set_fact:
+        drift_firewall:
+          profiles: "{{ drift_fw_list }}"
+          any_drift: "{{ (drift_fw_list | selectattr('drift','eq', true) | list | length) > 0 }}"
+      changed_when: false
+
+    # Admins drift
+    - name: Build admins drift
+      ansible.builtin.set_fact:
+        desired_admins: "{{ baseline.local_admins.members | default([]) }}"
+        admins_missing: "{{ desired_admins | difference(o_admins | list) }}"
+        admins_unexpected: "{{ (o_admins | list) | difference(desired_admins) }}"
+      changed_when: false
+
+    # Registry drift (align by loop index)
+    - name: Init registry drift
+      ansible.builtin.set_fact:
+        drift_registry: []
+      changed_when: false
+
+    - name: Compute registry drift
+      ansible.builtin.set_fact:
+        drift_registry: "{{ drift_registry + [ {
+          'path': item.path,
+          'name': item.name,
+          'type': item.type | lower,
+          'want': item.data,
+          'exists': (reg_stats.results[loop.index0].exists | default(false)),
+          'current_type': (reg_stats.results[loop.index0].type | default('') | lower),
+          'current_value': reg_stats.results[loop.index0].value | default(''),
+          'drift': ( (not (reg_stats.results[loop.index0].exists | default(false)))
+                     or ((item.type | lower) != (reg_stats.results[loop.index0].type | default('') | lower))
+                     or ((item.data | string) != (reg_stats.results[loop.index0].value | default('') | string)) )
+        } ] }}"
+      loop: "{{ baseline.registry }}"
+      changed_when: false
+
+    # Software drift
+    - name: Compute software presence lists
+      ansible.builtin.set_fact:
+        app_names_lower: "{{ o_apps | map(attribute='DisplayName') | map('lower') | list }}"
+        baseline_req_names_lower: "{{ baseline.software.required | map(attribute='display') | map('lower') | list }}"
+        required_missing_names_lower: "{{ baseline_req_names_lower | difference(app_names_lower) }}"
+        banned_present: []
+        required_missing: []
+      changed_when: false
+
+    - name: Collect required-missing (display names)
+      ansible.builtin.set_fact:
+        required_missing: "{{ required_missing + [ item.display ] }}"
+      when: "(item.display | lower) in required_missing_names_lower"
+      loop: "{{ baseline.software.required }}"
+      changed_when: false
+
+    - name: Collect banned-present (by DisplayName match)
+      ansible.builtin.set_fact:
+        banned_present: "{{ (banned_present + (o_apps | selectattr('DisplayName','search', item.regex) | map(attribute='DisplayName') | list)) | unique }}"
+      loop: "{{ baseline.software.banned | selectattr('regex','defined') | list }}"
+      changed_when: false
+
+    - name: Assemble drift report object
+      ansible.builtin.set_fact:
+        drift:
+          services: "{{ drift_services }}"
+          firewall: "{{ drift_firewall }}"
+          admins:
+            enforce_pure: "{{ baseline.local_admins.enforce_pure | default(false) }}"
+            missing: "{{ admins_missing }}"
+            unexpected: "{{ admins_unexpected }}"
+          registry: "{{ drift_registry }}"
+          software:
+            required_missing: "{{ required_missing }}"
+            banned_present: "{{ banned_present }}"
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+    # 3) RECTIFY (only when drift_mode == enforce)
+    # -------------------------------------------------------------------------
+    - name: Enforce service start mode
+      ansible.windows.win_service:
+        name: "{{ item.name }}"
+        start_mode: "{{ item.start | lower }}"
+      loop: "{{ baseline.services }}"
+      when: drift_mode == 'enforce'
+      register: fix_service_mode
+
+    - name: Enforce service running/stopped state
+      ansible.windows.win_service:
+        name: "{{ item.name }}"
+        state: "{{ 'started' if (item.state | lower) == 'running' else 'stopped' }}"
+      loop: "{{ baseline.services }}"
+      when: drift_mode == 'enforce'
+      register: fix_service_state
+
+    # Firewall enforcement — Private ON, Domain/Public OFF
+    - name: Build profile sets for firewall enforcement
+      ansible.builtin.set_fact:
+        enable_profiles:  "{{ (baseline.firewall.desired_enabled.Private | default(true))  | ternary(['Private'], []) }}"
+        disable_profiles: >-
+          {{
+            (baseline.firewall.desired_enabled.Domain | default(false))  | ternary([], ['Domain'])
+            +
+            (baseline.firewall.desired_enabled.Public | default(false))  | ternary([], ['Public'])
+          }}
+      changed_when: false
+
+    - name: Enable firewall on Private (as required)
+      community.windows.win_firewall:
+        state: enabled
+        profiles: "{{ enable_profiles }}"
+      when:
+        - drift_mode == 'enforce'
+        - enable_profiles | length > 0
+
+    - name: Disable firewall on Domain and Public (as required)
+      community.windows.win_firewall:
+        state: disabled
+        profiles: "{{ disable_profiles }}"
+      when:
+        - drift_mode == 'enforce'
+        - disable_profiles | length > 0
+
+    - name: Enforce local Administrators membership
+      ansible.windows.win_group_membership:
+        name: "{{ baseline.local_admins.group }}"
+        members: "{{ baseline.local_admins.members | default([]) }}"
+        state: "{{ 'pure' if (baseline.local_admins.enforce_pure | default(false)) else 'present' }}"
+      when: drift_mode == 'enforce'
+      register: fix_admins
+
+    - name: Enforce registry keys/values
+      ansible.windows.win_regedit:
+        path: "{{ item.path }}"
+        name: "{{ item.name }}"
+        data: "{{ item.data }}"
+        type: "{{ item.type }}"
+        state: present
+      loop: "{{ baseline.registry }}"
+      when: drift_mode == 'enforce'
+      register: fix_registry
+
+    - name: Ensure required Chocolatey packages are present
+      chocolatey.chocolatey.win_chocolatey:
+        name: "{{ item.choco }}"
+        state: present
+      loop: "{{ baseline.software.required | selectattr('choco','defined') | list }}"
+      when: drift_mode == 'enforce'
+      register: fix_software_required
+
+    - name: Remove banned software by product_id (MSI only)
+      ansible.windows.win_package:
+        product_id: "{{ item.product_id }}"
+        state: absent
+      loop: "{{ baseline.software.banned | selectattr('product_id','defined') | list }}"
+      when: drift_mode == 'enforce'
+      register: fix_software_banned
+
+    # -------------------------------------------------------------------------
+    # 4) Report artifact on controller
+    # -------------------------------------------------------------------------
+    - name: Ensure report directory on controller
+      ansible.builtin.file:
+        path: "{{ drift_report_path | dirname }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+
+    - name: Timestamp for report
+      ansible.builtin.set_fact:
+        report_ts: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+      delegate_to: localhost
+
+    - name: Write drift report (JSON)
+      ansible.builtin.copy:
+        dest: "{{ drift_report_path }}"
+        mode: "0644"
+        content: |
+          {
+            "host": "{{ inventory_hostname }}",
+            "timestamp": "{{ report_ts }}",
+            "mode": "{{ drift_mode }}",
+            "drift": {{ drift | to_json }},
+            "observed_summary": {
+              "firewall_profiles": {{ o_fw_list | to_json }},
+              "admins": {{ o_admins | to_json }},
+              "services": {{ o_services | to_json }}
+            }
+          }
+      delegate_to: localhost
+
+    - name: Fail if critical drift and in report mode (guard)
+      ansible.builtin.fail:
+        msg: >
+          Critical drift detected (services or firewall). Switch to 'enforce' or adjust baseline.
+      when:
+        - drift_mode == 'report'
+        - ( (drift_services | selectattr('required','equalto', true) | selectattr('start_drift','equalto', true) | list | length) > 0 )
+          or ( (drift_services | selectattr('required','equalto', true) | selectattr('state_drift','equalto', true) | list | length) > 0 )
+          or ( drift_firewall.any_drift | default(false) )

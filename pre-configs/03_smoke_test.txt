@@ -1,0 +1,11 @@
+# Create creds (local or domain). For local, use .\ansible-admin
+$cred = Get-Credential
+
+# HTTPS + Basic (workgroup/local accounts)
+Test-WSMan -ComputerName $env:COMPUTERNAME -UseSSL -Authentication Basic -Credential $cred
+
+# HTTPS + Negotiate (NTLM/Kerberos)
+Test-WSMan -ComputerName $env:COMPUTERNAME -UseSSL -Authentication Negotiate -Credential $cred
+
+# HTTP + Negotiate (domain Kerberos/NTLM)
+Test-WSMan -ComputerName $env:COMPUTERNAME -Authentication Negotiate -Credential $cred
