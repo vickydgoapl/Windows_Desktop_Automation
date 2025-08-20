@@ -1,0 +1,190 @@
+---
+- name: RemoteMy Windows Management
+  hosts: windows1
+  gather_facts: yes
+  vars:
+    usage_threshold_percent: 80
+    min_multiplier: 1.5
+    max_pagefile_mb: 32768
+
+  tasks:
+
+#-----------------------------------------Startup App Disable-------------------                                                                             -----------------------
+    - name: List running processes
+      ansible.windows.win_shell: |
+        Get-Process | Select-Object Id, Name, CPU, WorkingSet64 | Format-Table -                                                                             AutoSize
+      tags: task_manager
+
+    - name: List and disable startup apps
+      block:
+        - name: Get startup apps
+          ansible.windows.win_shell: |
+            Get-CimInstance Win32_StartupCommand | Select-Object Name, Command,                                                                              Location, User | Format-Table -AutoSize
+
+        - name: Disable all startup apps
+          ansible.windows.win_shell: |
+            Get-CimInstance Win32_StartupCommand | ForEach-Object { Remove-CimIn                                                                             stance $_ -ErrorAction SilentlyContinue }
+          ignore_errors: true
+      tags: startup_apps
+
+#----------------------------------------Temp Clearance-------------------------                                                                             -----------------------
+    - name: Clean temp files including ITadmin user temp
+      ansible.windows.win_shell: |
+        $tempPaths = @(
+          "$env:TEMP",
+          "C:\Windows\Temp",
+          "C:\Users\ITadmin\AppData\Local\Temp"
+        )
+        foreach ($path in $tempPaths) {
+          if (Test-Path $path) {
+            try {
+              Remove-Item -Path "$path\*" -Force -Recurse -ErrorAction SilentlyC                                                                             ontinue
+            } catch {
+              # ignore errors
+            }
+          }
+        }
+      failed_when: false
+
+#-------------------------------------------Chrome Cache Clearance--------------                                                                             ------------------------
+
+    - name: Find Chrome cache folders for all users
+      ansible.windows.win_shell: |
+        Get-ChildItem -Path "C:\Users" -Directory -Force | ForEach-Object {
+          $userPath = "$($_.FullName)\AppData\Local\Google\Chrome\User Data"
+          if (Test-Path $userPath) {
+            Get-ChildItem -Path $userPath -Directory -Recurse -Force -ErrorActio                                                                             n SilentlyContinue |
+              Where-Object { $_.Name -match 'cache' }
+          }
+        } | Select-Object -ExpandProperty FullName
+      register: chrome_cache_paths
+
+    - name: Debug found paths
+      debug:
+        var: chrome_cache_paths.stdout_lines
+
+    - name: Delete contents of all found cache folders and log deleted files
+      ansible.windows.win_shell: |
+        $logFile = "C:\Temp\chrome_cache_cleanup.log"
+        Remove-Item $logFile -ErrorAction SilentlyContinue
+
+        # Create log with header
+        "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Starting Chrome cache cleanup                                                                             ..." | Out-File -FilePath $logFile -Append -Encoding utf8
+
+        # Create array
+        $paths = @('{{ chrome_cache_paths.stdout_lines | map('regex_replace', '\                                                                             \\\', '\\') | join("', '") }}')
+
+        foreach ($path in $paths) {
+          try {
+            if (Test-Path $path) {
+              $files = Get-ChildItem -Path "$path\*" -Recurse -Force -ErrorActio                                                                             n Stop
+              if ($files) {
+                $fileCount = $files.Count
+                "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Deleting $fileCount f                                                                             iles in: $path" | Out-File -FilePath $logFile -Append -Encoding utf8
+                foreach ($file in $files) {
+                  "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Deleted: $($file.Fu                                                                             llName)" | Out-File -FilePath $logFile -Append -Encoding utf8
+                }
+                Remove-Item -Path "$path\*" -Recurse -Force -ErrorAction Stop
+              } else {
+                "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') No files found in: $p                                                                             ath" | Out-File -FilePath $logFile -Append -Encoding utf8
+              }
+            } else {
+              "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Path not found: $path"                                                                              | Out-File -FilePath $logFile -Append -Encoding utf8
+            }
+          } catch {
+            "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Error for path ${path}: $                                                                             _" | Out-File -FilePath $logFile -Append -Encoding utf8
+          }
+        }
+        "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') Cleanup completed." | Out-Fil                                                                             e -FilePath $logFile -Append -Encoding utf8
+      register: deletion_result
+      ignore_errors: true
+
+    # ---------- Prefetch cleanup block (new, robust) ----------
+    - name: Count Prefetch files (before)
+      ansible.windows.win_shell: |
+        (Get-ChildItem -Path "C:\Windows\Prefetch" -Force -ErrorAction SilentlyC                                                                             ontinue).Count
+      register: prefetch_count_before
+      ignore_errors: true
+      tags: clean_prefetch
+
+    - name: Stop SysMain (Superfetch) service to release locks
+      ansible.windows.win_service:
+        name: SysMain
+        state: stopped
+      ignore_errors: true
+      tags: clean_prefetch
+
+    - name: Attempt to take ownership and grant Administrators full control on P                                                                             refetch
+      ansible.windows.win_shell: |
+        takeown /F "C:\Windows\Prefetch" /R /A || echo "takeown failed"
+        icacls "C:\Windows\Prefetch" /grant Administrators:F /T /C || echo "icac                                                                             ls failed"
+      args:
+        executable: cmd
+      ignore_errors: true
+      tags: clean_prefetch
+
+    - name: Delete Prefetch .pf files (ignore locked / protected files)
+      ansible.windows.win_shell: |
+        Get-ChildItem -Path "C:\Windows\Prefetch\*.pf" -Force -ErrorAction Silen                                                                             tlyContinue |
+          Remove-Item -Force -ErrorAction SilentlyContinue
+        exit 0
+      ignore_errors: true
+      tags: clean_prefetch
+
+    - name: Start SysMain (Superfetch) service again
+      ansible.windows.win_service:
+        name: SysMain
+        state: started
+      ignore_errors: true
+      tags: clean_prefetch
+
+    - name: Count Prefetch files (after)
+      ansible.windows.win_shell: |
+        (Get-ChildItem -Path "C:\Windows\Prefetch" -Force -ErrorAction SilentlyC                                                                             ontinue).Count
+      register: prefetch_count_after
+      ignore_errors: true
+      tags: clean_prefetch
+
+    - name: Show Prefetch counts before/after
+      ansible.builtin.debug:
+        msg:
+          - "prefetch_count_before: {{ prefetch_count_before.stdout | default('0                                                                             ') }}"
+          - "prefetch_count_after:  {{ prefetch_count_after.stdout  | default('0                                                                             ') }}"
+      tags: clean_prefetch
+
+# ---------- Increasing Virtual Memory -----------------------------------------                                                                             ------------------------------
+
+    - name: Check current pagefile and decide if upgrade needed
+      block:
+        - name: Get current pagefile stats using CimInstance
+          ansible.windows.win_shell: |
+            $stats = Get-CimInstance Win32_PageFileUsage
+            "AllocatedBaseSize=$($stats.AllocatedBaseSize);PeakUsage=$($stats.Pe                                                                             akUsage)"
+          register: pagefile_stats
+
+        - name: Parse pagefile stats
+          set_fact:
+            allocated_mb: "{{ pagefile_stats.stdout | regex_search('AllocatedBas                                                                             eSize=(\\d+)', '\\1') | first | default(0) | int }}"
+            peak_usage_mb: "{{ pagefile_stats.stdout | regex_search('PeakUsage=(                                                                             \\d+)', '\\1') | first | default(0) | int }}"
+
+        - name: Calculate threshold
+          set_fact:
+            threshold_mb: "{{ ((allocated_mb | int * usage_threshold_percent | i                                                                             nt) // 100) }}"
+
+        - name: Calculate if increase needed
+          set_fact:
+            needs_increase: "{{ (peak_usage_mb | int > threshold_mb | int) or (a                                                                             llocated_mb | int < ansible_memtotal_mb | int) }}"
+            new_size_mb: "{{ [allocated_mb | int * 2, (ansible_memtotal_mb | int                                                                              * min_multiplier) | int, max_pagefile_mb] | min | int }}"
+
+        - name: Upgrade virtual memory if needed
+          ansible.windows.win_shell: |
+            $drive = "C:"
+            $newSize = {{ new_size_mb }}
+            $pagefile = Get-CimInstance Win32_PageFileSetting -Filter "SettingID                                                                             ='pagefile.sys @ $drive'"
+            if ($pagefile) {
+              $pagefile.InitialSize = $newSize
+              $pagefile.MaximumSize = $newSize
+              $pagefile | Set-CimInstance
+            }
+          when: needs_increase | bool
+      tags: virtual_memory
