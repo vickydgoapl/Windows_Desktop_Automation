@@ -1,0 +1,117 @@
+---
+- name: Analyze / optimize Windows disks (SSD-aware)
+  hosts: windows_desktops
+  gather_facts: no
+
+  vars:
+    # === Behavior toggles ===
+    analyze_only: false          # true = don't change anything; just analyze
+    include_drives: ['C']           # e.g. ['C','D']; empty = all fixed drives
+    run_on_ssd: true             # allow optimization on SSDs (ReTrim)
+    run_on_hdd: true             # allow optimization on HDDs (Defrag)
+    verbose_output: true
+
+  pre_tasks:
+    - name: Ensure Storage module is available
+      ansible.windows.win_powershell:
+        script: |
+          Import-Module Storage -ErrorAction Stop
+          'OK'
+      register: storage_mod
+      changed_when: false
+
+  tasks:
+    - name: Discover fixed volumes and media type
+      ansible.windows.win_shell: |
+        $items = @(
+          Get-Volume |
+            Where-Object { $_.DriveType -eq 'Fixed' -and $_.DriveLetter } |
+            ForEach-Object {
+              $part = Get-Partition -DriveLetter $_.DriveLetter -ErrorAction SilentlyContinue
+              if ($null -eq $part) { return }
+              $disk = Get-Disk -Number $part.DiskNumber -ErrorAction SilentlyContinue
+              [pscustomobject]@{
+                DriveLetter = $_.DriveLetter
+                MediaType   = $disk.MediaType
+                Size        = $_.Size
+                FS          = $_.FileSystemType
+              }
+            }
+        )
+        $out = [pscustomobject]@{ Items = $items }   # <— ALWAYS has an Items array
+        $out | ConvertTo-Json -Compress -Depth 5
+      register: vol_json
+      changed_when: false
+
+    - name: Parse discovered volumes
+      ansible.builtin.set_fact:
+        win_drives_all: "{{ ((vol_json.stdout | default('{}')) | from_json).Items | default([]) | list }}"
+
+    - name: Build drive list (apply includes if provided)
+      ansible.builtin.set_fact:
+        win_drives: >-
+          {{
+            (include_drives | length > 0)
+            | ternary(
+                win_drives_all
+                  | selectattr('DriveLetter','in', (include_drives | map('upper') | list))
+                  | list,
+                win_drives_all
+              )
+          }}
+
+    - name: Sanity-check drive objects
+      ansible.builtin.assert:
+        that:
+          - win_drives is iterable
+          - (win_drives | length) == 0 or (win_drives[0] is mapping and 'DriveLetter' in win_drives[0])
+        fail_msg: "Parsed drives not a list of objects. Raw stdout: {{ vol_json.stdout }}"
+
+    - name: Show what we’ll touch
+      ansible.builtin.debug:
+        msg: >-
+          Will process {{ (win_drives | default([])) | map(attribute='DriveLetter') | join(', ') }}
+          (analyze_only={{ analyze_only }})
+
+    # ---- ANALYZE ONLY ----
+    - name: Analyze volumes (no changes)
+      ansible.windows.win_shell: Optimize-Volume -DriveLetter {{ item.DriveLetter }} -Analyze {{ '-Verbose' if verbose_output else '' }}
+      loop: "{{ win_drives }}"
+      loop_control: { label: "{{ item.DriveLetter }} ({{ item.MediaType }})" }
+      when: analyze_only
+      register: analyze_out
+      changed_when: false
+
+    # ---- OPTIMIZE: SSD ----
+    - name: Optimize SSDs (ReTrim)
+      ansible.windows.win_shell: Optimize-Volume -DriveLetter {{ item.DriveLetter }} -ReTrim {{ '-Verbose' if verbose_output else '' }}
+      loop: "{{ win_drives }}"
+      loop_control: { label: "{{ item.DriveLetter }} ({{ item.MediaType }})" }
+      when:
+        - not analyze_only
+        - run_on_ssd
+        - ((item.MediaType | default('', true) | string | lower) == 'ssd')
+      register: ssd_trim
+
+    # ---- OPTIMIZE: HDD ----
+    - name: Defragment HDDs
+      ansible.windows.win_shell: Optimize-Volume -DriveLetter {{ item.DriveLetter }} -Defrag {{ '-Verbose' if verbose_output else '' }}
+      loop: "{{ win_drives }}"
+      loop_control: { label: "{{ item.DriveLetter }} ({{ item.MediaType }})" }
+      when:
+        - not analyze_only
+        - run_on_hdd
+        - ((item.MediaType | default('unspecified', true) | string | lower) in ['hdd','unspecified'])
+      register: hdd_defrag
+
+  post_tasks:
+    - name: Summarize results
+      ansible.builtin.debug:
+        msg:
+          analyzed: "{{ (analyze_out.results | default([])) | length }}"
+          retrimmed_ssd: "{{ (ssd_trim.results | default([])) | selectattr('rc','defined') | list | length }}"
+          defragged_hdd: "{{ (hdd_defrag.results | default([])) | selectattr('rc','defined') | list | length }}"
+
+    - debug: var=vol_json.stdout
+    - debug: var=win_drives_all
+    - debug: var=win_drives

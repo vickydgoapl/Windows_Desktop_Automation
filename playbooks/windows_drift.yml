@@ -11,7 +11,7 @@
   vars:
     # === Mode ===
     drift_mode: report              # report | enforce
-    drift_report_path: "reports/drift_{{ inventory_hostname }}.json"
+    drift_report_path: "../reports/drift_{{ inventory_hostname }}.json"
 
     # === Baseline ===
     baseline:
@@ -125,7 +125,7 @@
             LocalAdmins         = $admins
             InstalledApps       = $apps
           }
-        arguments:
+        parameters:
           ServiceNames: "{{ baseline.services | map(attribute='name') | list }}"
       register: observed_raw
       changed_when: false
@@ -204,12 +204,17 @@
       changed_when: false
 
     # Admins drift
-    - name: Build admins drift
+    - name: Build admins drift (stage 1 - desired list)
       ansible.builtin.set_fact:
-        desired_admins: "{{ baseline.local_admins.members | default([]) }}"
-        admins_missing: "{{ desired_admins | difference(o_admins | list) }}"
-        admins_unexpected: "{{ (o_admins | list) | difference(desired_admins) }}"
+        desired_admins: "{{ baseline.local_admins.members | default([], true) | list }}"
       changed_when: false
+
+    - name: Build admins drift (stage 2 - compare)
+      ansible.builtin.set_fact:
+        admins_missing:    "{{ desired_admins | list | difference(o_admins | default([], true) | list) }}"
+        admins_unexpected: "{{ (o_admins | default([], true) | list) | difference(desired_admins | list) }}"
+      changed_when: false
+
 
     # Registry drift (align by loop index)
     - name: Init registry drift
@@ -220,42 +225,56 @@
     - name: Compute registry drift
       ansible.builtin.set_fact:
         drift_registry: "{{ drift_registry + [ {
-          'path': item.path,
-          'name': item.name,
-          'type': item.type | lower,
-          'want': item.data,
-          'exists': (reg_stats.results[loop.index0].exists | default(false)),
-          'current_type': (reg_stats.results[loop.index0].type | default('') | lower),
-          'current_value': reg_stats.results[loop.index0].value | default(''),
-          'drift': ( (not (reg_stats.results[loop.index0].exists | default(false)))
-                     or ((item.type | lower) != (reg_stats.results[loop.index0].type | default('') | lower))
-                     or ((item.data | string) != (reg_stats.results[loop.index0].value | default('') | string)) )
-        } ] }}"
+                            'path': item.path,
+                            'name': item.name,
+                            'type': (item.type | lower),
+                            'want': item.data,
+                            'exists':        (reg_stats.results[reg_idx].exists | default(false)),
+                            'current_type':  (reg_stats.results[reg_idx].type   | default('') | lower),
+                            'current_value': (reg_stats.results[reg_idx].value  | default('')),
+                            'drift': (
+                                      (not (reg_stats.results[reg_idx].exists | default(false))) or
+                                      ((item.type | lower) != (reg_stats.results[reg_idx].type  | default('') | lower)) or
+                                      ((item.data | string) != (reg_stats.results[reg_idx].value | default('') | string))
+                                      )
+                              } ] }}"
       loop: "{{ baseline.registry }}"
+      loop_control:
+        index_var: reg_idx        # <-- THIS is the replacement for loop.index0
+        label: "{{ item.path }}\\{{ item.name }}"
       changed_when: false
 
     # Software drift
-    - name: Compute software presence lists
+    - name: Software drift — stage 0 --- init accumulators
       ansible.builtin.set_fact:
-        app_names_lower: "{{ o_apps | map(attribute='DisplayName') | map('lower') | list }}"
-        baseline_req_names_lower: "{{ baseline.software.required | map(attribute='display') | map('lower') | list }}"
-        required_missing_names_lower: "{{ baseline_req_names_lower | difference(app_names_lower) }}"
-        banned_present: []
         required_missing: []
+        banned_present: []
       changed_when: false
 
-    - name: Collect required-missing (display names)
+    - name: Software drift — stage 1 --- compute lowercase name lists
+      ansible.builtin.set_fact:
+        app_names_lower: "{{ o_apps | map(attribute='DisplayName') | select('string') | map('lower') | list }}"
+        baseline_req_names_lower: "{{ baseline.software.required | default([], true) | map(attribute='display') | select('string') | map('lower') | list }}"
+      changed_when: false
+
+    - name: Software drift — stage 2 --- which required are missing (lowercase)
+      ansible.builtin.set_fact:
+        required_missing_names_lower: "{{ baseline_req_names_lower | difference(app_names_lower) }}"
+      changed_when: false
+
+    - name: Software drift — stage 3 --- collect required-missing (original case)
       ansible.builtin.set_fact:
         required_missing: "{{ required_missing + [ item.display ] }}"
+      loop: "{{ baseline.software.required | default([], true) }}"
       when: "(item.display | lower) in required_missing_names_lower"
-      loop: "{{ baseline.software.required }}"
       changed_when: false
 
-    - name: Collect banned-present (by DisplayName match)
+    - name: Software drift — stage 4 --- collect banned-present (safe search)
       ansible.builtin.set_fact:
-        banned_present: "{{ (banned_present + (o_apps | selectattr('DisplayName','search', item.regex) | map(attribute='DisplayName') | list)) | unique }}"
+        banned_present:  "{{ (banned_present + (o_apps | selectattr('DisplayName','string') | selectattr('DisplayName','search', item.regex) | map(attribute='DisplayName') | list) ) | unique }}"
       loop: "{{ baseline.software.banned | selectattr('regex','defined') | list }}"
       changed_when: false
+
 
     - name: Assemble drift report object
       ansible.builtin.set_fact:
