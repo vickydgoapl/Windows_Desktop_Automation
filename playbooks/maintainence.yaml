@@ -1,5 +1,5 @@
 ---
-- name: RemoteMy Windows Management
+- name: Remote Windows Management
   hosts: windows1
   gather_facts: yes
   vars:
@@ -9,17 +9,17 @@
 
   tasks:
 
-#-----------------------------------------Startup App Disable-------------------                                                                             -----------------------
+#-----------------------------------------Startup App Disable---------------------------------------------
     - name: List running processes
       ansible.windows.win_shell: |
-        Get-Process | Select-Object Id, Name, CPU, WorkingSet64 | Format-Table - AutoSize
+        Get-Process | Select-Object Id, Name, CPU, WorkingSet64 | Format-Table -AutoSize
       tags: task_manager
 
     - name: List and disable startup apps
       block:
         - name: Get startup apps
           ansible.windows.win_shell: |
-            Get-CimInstance Win32_StartupCommand | Select-Object Name, Command,Location, User | Format-Table -AutoSize
+            Get-CimInstance Win32_StartupCommand | Select-Object Name, Command, Location, User | Format-Table -AutoSize
 
         - name: Disable all startup apps
           ansible.windows.win_shell: |
@@ -27,7 +27,7 @@
           ignore_errors: true
       tags: startup_apps
 
-#----------------------------------------Temp Clearance-------------------------                                                                             -----------------------
+#----------------------------------------Temp Clearance--------------------------------------------------
     - name: Clean temp files including ITadmin user temp
       ansible.windows.win_shell: |
         $tempPaths = @(
@@ -46,7 +46,7 @@
         }
       failed_when: false
 
-#-------------------------------------------Chrome Cache Clearance--------------                                                                             ------------------------
+#-------------------------------------------Chrome Cache Clearance---------------------------------------
 
     - name: Find Chrome cache folders for all users
       ansible.windows.win_shell: |
@@ -99,7 +99,7 @@
       register: deletion_result
       ignore_errors: true
 
-    # ---------- Prefetch cleanup block (new, robust) ----------
+# ---------- Prefetch cleanup block (new, robust) ----------
     - name: Count Prefetch files (before)
       ansible.windows.win_shell: |
         (Get-ChildItem -Path "C:\Windows\Prefetch" -Force -ErrorAction SilentlyContinue).Count
@@ -152,7 +152,7 @@
           - "prefetch_count_after:  {{ prefetch_count_after.stdout  | default('0') }}"
       tags: clean_prefetch
 
-# ---------- Increasing Virtual Memory -----------------------------------------                                                                             ------------------------------
+# ---------- Increasing Virtual Memory ------------------------------------------
 
     - name: Check current pagefile and decide if upgrade needed
       block:
@@ -188,12 +188,11 @@
             }
           when: needs_increase | bool
       tags: virtual_memory
------------------------------------------Clearing Recycle bin------------------------------------------------------
 
-    - name: Empty Recycle Bin using Clear-RecycleBin cmdlet 
+#-----------------------------------------Clearing Recycle bin--------------------------------------------
+
+    - name: Empty Recycle Bin using Clear-RecycleBin cmdlet
       ansible.windows.win_shell: |
         Clear-RecycleBin -Force -ErrorAction SilentlyContinue
       ignore_errors: true  # Skip any inaccessible items without failing the task
-      
-
 
