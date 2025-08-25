@@ -1,0 +1,131 @@
+---
+- name: Local user management (users, groups, rights, policy, profiles)
+  hosts: windows_desktops
+  gather_facts: no
+
+  collections:
+    - ansible.windows
+    - community.windows
+
+  vars:
+    # Path to your spec file (JSON or YAML). See example below.
+    users_spec_file: "../files/local_user_spec.yml"
+
+    # If true, set LocalAccountTokenFilterPolicy=1 so local admins stay admins over WinRM
+    enable_local_admin_token: true
+
+  vars_files:
+    - ../files/local_user_spec.yml
+
+  # --- Pre: load and validate the spec cleanly ---
+  pre_tasks:
+    - name: Map vars-file keys to playbook facts
+      ansible.builtin.set_fact:
+        spec_local_users:       "{{ local_users       | default([],  true) }}"
+        spec_group_memberships: "{{ group_memberships | default([],  true) }}"
+        spec_user_rights:       "{{ user_rights       | default({},  true) }}"
+        spec_security_policy:   "{{ security_policy   | default({},  true) }}"
+      changed_when: false
+
+    - name: Basic schema checks
+      ansible.builtin.assert:
+        that:
+          - spec_local_users is sequence
+          - spec_group_memberships is sequence
+          - spec_user_rights is mapping
+          - spec_security_policy is mapping
+          - (spec_local_users | selectattr('name','defined') | list | length) == (spec_local_users | length)
+        fail_msg: >
+          Vars file schema invalid. Ensure local_users/group_memberships are lists,
+          user_rights/security_policy are maps, and each local_users item has 'name'.
+
+  tasks:
+    ###########################################################################
+    # USERS — present/update
+    ###########################################################################
+    - name: Ensure local users (present/updated)
+      ansible.windows.win_user:
+        name:  "{{ item.name }}"
+        state: "{{ item.state | default('present') }}"
+        description: "{{ item.description | default(omit) }}"
+        fullname:    "{{ item.fullname    | default(omit) }}"
+        password:    "{{ item.password    | default(omit) }}"          # store via Ansible Vault
+        update_password: "{{ item.update_password | default('on_create') }}"
+        account_disabled:           "{{ item.account_disabled           | default(omit) }}"
+        user_cannot_change_password: "{{ item.user_cannot_change_password| default(omit) }}"
+        password_never_expires:     "{{ item.password_never_expires     | default(omit) }}"
+        password_expired:           "{{ item.password_expired           | default(omit) }}"
+        account_expires:            "{{ item.account_expires            | default(omit) }}"
+        # Optional: drive group membership via win_user (adds; won't purge)
+        groups: "{{ item.groups | default([]) }}"
+        groups_action: add
+      loop: "{{ spec_local_users | selectattr('state','defined') | list + (spec_local_users | rejectattr('state','defined') | list) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.state | default('present') != 'absent'
+
+
+    ###########################################################################
+    # USER RIGHTS — RDP/Service/Batch logon etc. (GPO may override in a domain)
+    ###########################################################################
+    - name: Apply user rights (replace the list for each right)
+      ansible.windows.win_user_right:
+        name: "{{ item.key }}"
+        action: set
+        users: "{{ item.value }}"
+      loop: "{{ spec_user_rights | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      # Note: For local accounts, prefer prefixing with '.\' to avoid domain ambiguity.
+      # Example: ".\\ansible-admin"
+      # (See docs for details.)
+
+    ###########################################################################
+    # SECURITY POLICY — local password policy, etc. (via SecEdit)
+    ###########################################################################
+    - name: Apply local security policy (System Access)
+      community.windows.win_security_policy:
+        section: System Access
+        key: "{{ item.key }}"
+        value: "{{ item.value }}"
+      loop: "{{ spec_security_policy | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      # Examples of keys:
+      #   MinimumPasswordLength, PasswordComplexity (0/1), MaximumPasswordAge, PasswordHistorySize
+
+    ###########################################################################
+    # USERS — absent (then purge their profile if asked)
+    ###########################################################################
+    - name: Remove local users (state=absent)
+      ansible.windows.win_user:
+        name: "{{ item.name }}"
+        state: absent
+      loop: "{{ spec_local_users | selectattr('state','equalto','absent') | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+
+    ###########################################################################
+    # OPTIONAL — keep local admins “admin” over the network (UAC token filter)
+    ###########################################################################
+    - name: Allow local admin token over remote (LocalAccountTokenFilterPolicy=1)
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+        name: LocalAccountTokenFilterPolicy
+        type: dword
+        data: 1
+        state: present
+      when: enable_local_admin_token | bool
+
+    ###########################################################################
+    # Summary (because future-you will thank present-you)
+    ###########################################################################
+    - name: Summary — users managed
+      ansible.builtin.debug:
+        msg:
+          - "Users (present): {{ spec_local_users | selectattr('state','undefined') | map(attribute='name') | list
+                                  + (spec_local_users | selectattr('state','equalto','present') | map(attribute='name') | list) }}"
+          - "Users (removed): {{ spec_local_users | selectattr('state','equalto','absent') | map(attribute='name') | list }}"
+          - "User rights set: {{ spec_user_rights.keys() | list }}"
+          - "Security policy keys: {{ spec_security_policy.keys() | list }}"

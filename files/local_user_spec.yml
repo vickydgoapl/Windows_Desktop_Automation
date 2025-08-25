@@ -1,0 +1,30 @@
+# Local users to ensure
+local_users:
+  - name: "vickyd"
+    description: "Managed local admin"
+    password: "YourNewPassword!"
+    update_password: on_create
+    password_never_expires: true
+    account_disabled: false
+    groups:
+      - Administrators
+      - Remote Management Users
+      - Remote Desktop Users
+    state: present
+    purge_profile: false
+
+  - name: tempuser
+    state: absent
+    purge_profile: true
+
+
+# User rights (RDP logon, etc.)
+user_rights:
+  SeRemoteInteractiveLogonRight:
+    - '.\Administrators'
+    - 'Remote Desktop Users'
+
+# Local security policy
+security_policy:
+  MinimumPasswordLength: '12'
+  PasswordComplexity: '1'

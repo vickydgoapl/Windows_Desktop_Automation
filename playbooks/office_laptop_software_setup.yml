@@ -1,7 +1,7 @@
 ---
 - name: Install common apps on Windows the right way
   hosts: windows_desktops
-  gather_facts: no
+  gather_facts: yes
 
   collections:
     - chocolatey.chocolatey
@@ -11,11 +11,11 @@
     # Toggle what to install
     install_7zip: false
     install_anydesk: false
-    install_chrome: true
+    install_chrome: false
     install_adobe_reader: false         # Reader (free). For Acrobat Pro, see below.
     install_adobe_acrobat_pro: false    # Needs Adobe Admin Console package
     install_checkpoint: false           # Needs exact product + URL below
-    install_m365_apps: false            # Office via ODT (en-US)
+    install_m365_apps: true            # Office via ODT (en-US)
 
     # Optional version pins for choco packages
     seven_zip_version: null             # e.g. "23.01"
@@ -334,12 +334,22 @@
         - install_m365_apps | bool
         - not word_exe.stat.exists
 
-    - name: Pre-download M365 media (optional but recommended)
-      ansible.windows.win_command:
-        cmd: "{{ odt_root }}\\setup.exe /download {{ odt_root }}\\configuration.xml"
-      when:
-        - install_m365_apps | bool
-        - not word_exe.stat.exists
+    # - name: Pre-download M365 media (optional but recommended)
+    #   ansible.windows.win_command:
+    #     cmd: "{{ odt_root }}\\setup.exe /download {{ odt_root }}\\configuration.xml"
+    #   when:
+    #     - install_m365_apps | bool
+    #     - not word_exe.stat.exists
+
+    - name: fetch current time
+      ansible.windows.win_powershell:
+        script: |
+          (Get-Date).ToString('T')
+      register: start_time
+
+    - name: Show specific date/time components
+      ansible.builtin.debug:
+        msg: "Current time: {{ start_time }}"
 
     - name: Install/Configure M365
       ansible.windows.win_command:
@@ -347,3 +357,13 @@
       when:
         - install_m365_apps | bool
         - not word_exe.stat.exists
+
+    - name: fetch current time
+      ansible.windows.win_powershell:
+        script: |
+          (Get-Date).ToString('T')
+      register: end_time
+
+    - name: Show specific date/time components
+      ansible.builtin.debug:
+        msg: "Current time: {{ end_time }}"
