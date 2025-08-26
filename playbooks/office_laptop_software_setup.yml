@@ -130,160 +130,28 @@
       ansible.windows.win_reboot:
       when: install_checkpoint | bool
 
-    - name: Resolve client install paths (trac.exe, trac.defaults, service)
-      ansible.windows.win_powershell:
-        script: |
-          $candidates = @(
-            'C:\Program Files (x86)\CheckPoint\Endpoint Security\Endpoint Connect',
-            'C:\Program Files (x86)\CheckPoint\Endpoint Connect',
-            'C:\Program Files\CheckPoint\Endpoint Connect'
-          )
-          $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $found) { throw "Check Point client path not found" }
-
-          $tracDir = Join-Path $found 'trac'
-          $tracExe = Join-Path $tracDir 'trac.exe'
-          if (-not (Test-Path $tracExe)) {
-            # Some builds place trac.exe one level up
-            $tracExe = Join-Path $found 'trac.exe'
-          }
-          $defaults1 = Join-Path $found 'trac.defaults'
-          $defaults2 = Join-Path (Join-Path $found 'Endpoint Connect') 'trac.defaults'
-          $defaults  = @($defaults1,$defaults2) | Where-Object { Test-Path $_ } | Select-Object -First 1
-
-          $svcName = 'TracSrvWrapper'
-
-          $Ansible.Result = [pscustomobject]@{
-            BasePath = $found
-            TracExe  = $tracExe
-            Defaults = $defaults
-            Service  = $svcName
-          }
-      register: cp_paths
-      changed_when: false
-      when: install_checkpoint | bool
-
     - name: Stop VPN service
       ansible.windows.win_service:
         name: "{{ cp_paths.result.Service }}"
         state: stopped
       when: install_checkpoint | bool
 
-    - name: Remove any existing VPN sites not matching the desired one (registry-driven)
-      when: install_checkpoint | bool and remove_other_sites
-      ansible.windows.win_powershell:
-        script: |
-          param($TargetSite, $TracExe)
-          $ErrorActionPreference = 'Stop'
-          $roots = @(
-            'HKLM:\SOFTWARE\WOW6432Node\CheckPoint\TRAC\sites',
-            'HKLM:\SOFTWARE\CheckPoint\TRAC\sites'
-          )
-          $existing = @()
-          foreach ($r in $roots) {
-            if (Test-Path $r) {
-              Get-ChildItem -Path $r | ForEach-Object { $existing += $_.PSChildName }
-            }
-          }
-          $existing = $existing | Sort-Object -Unique
-          foreach ($s in $existing) {
-            if ($s -ne $TargetSite) {
-              & $TracExe delete -s $s | Out-Null
-            }
-          }
-          $Ansible.Result = $existing
-        parameters:
-          TargetSite: "{{ vpn_site_fqdn }}"
-          TracExe: "{{ cp_paths.result.TracExe }}"
-      register: deleted_sites
-      changed_when: >
-        (deleted_sites.result | default([])) | select('ne', vpn_site_fqdn) | list | length > 0
-
     - name: Create the single allowed site (idempotent)
       ansible.windows.win_powershell:
         script: |
-          param($TracExe, $Site, $Display, $LoginOpt, $Auth, $Fp)
-          $args = @('create','-s', $Site)
-          if ($Display) { $args += @('-di', $Display) }
-          if ($LoginOpt) { $args += @('-lo', $LoginOpt) }
-          if ($Auth)     { $args += @('-a',  $Auth) }
-          if ($Fp)       { $args += @('-f',  $Fp) }
-          & $TracExe @args | Out-Null
+          & "C:\Program Files (x86)\CheckPoint\Endpoint Connect\trac.exe" create -s "$Site" -di "$Site"
+          Stop-Process -Name TrGUI -ErrorAction SilentlyContinue
+          Start-Process "C:\Program Files (x86)\CheckPoint\Endpoint Connect\TrGUI.exe"
         parameters:
-          TracExe:  "{{ cp_paths.result.TracExe }}"
           Site:     "{{ vpn_site_fqdn }}"
-          Display:  "{{ vpn_site_display }}"
-          LoginOpt: "{{ vpn_login_option }}"
-          Auth:     "{{ vpn_auth_method }}"
-          Fp:       "{{ vpn_rootca_fingerprint }}"
       changed_when: false
       when: install_checkpoint | bool
-
-    - name: Optionally cache user credentials for the site (if provided)
-      when: install_checkpoint | bool and vpn_username | length > 0 and vpn_password | length > 0
-      ansible.windows.win_powershell:
-        script: |
-          param($TracExe, $Site, $User, $Pass)
-          & $TracExe userpass -s $Site -u $User -p $Pass | Out-Null
-        parameters:
-          TracExe: "{{ cp_paths.result.TracExe }}"
-          Site:    "{{ vpn_site_display | default(vpn_site_fqdn) }}"
-          User:    "{{ vpn_username }}"
-          Pass:    "{{ vpn_password }}"
-      changed_when: false
-
-    - name: Enforce 'predefined_sites_only' (lock UI/CLI to predefined sites)
-      when: install_checkpoint | bool and lock_sites and (cp_paths.result.Defaults | length > 0)
-      ansible.windows.win_powershell:
-        script: |
-          param($DefaultsPath)
-          if (-not (Test-Path $DefaultsPath)) { return }
-          $raw = Get-Content -Path $DefaultsPath -Raw
-          if ($raw -match '(?im)^\s*predefined_sites_only\b') {
-            $raw = [regex]::Replace(
-              $raw,
-              '(?im)^(?<pfx>\s*predefined_sites_only\s+\w+\s+)(?<val>true|false|0|1)(?<sfx>.*)$',
-              '${pfx}true${sfx}'
-            )
-          } else {
-            $raw += "`r`npredefined_sites_only STRING true GW_USER 0`r`n"
-          }
-          Set-Content -Path $DefaultsPath -Value $raw -Encoding ASCII
-        parameters:
-          DefaultsPath: "{{ cp_paths.result.Defaults }}"
-      changed_when: true
 
     - name: Start VPN service
       ansible.windows.win_service:
         name: "{{ cp_paths.result.Service }}"
         state: started
       when: install_checkpoint | bool
-
-    - name: Assert only the desired site exists
-      ansible.windows.win_powershell:
-        script: |
-          param($TargetSite)
-          $roots = @(
-            'HKLM:\SOFTWARE\WOW6432Node\CheckPoint\TRAC\sites',
-            'HKLM:\SOFTWARE\CheckPoint\TRAC\sites'
-          )
-          $sites = @()
-          foreach ($r in $roots) {
-            if (Test-Path $r) {
-              $sites += (Get-ChildItem -Path $r | Select-Object -Expand PSChildName)
-            }
-          }
-          $sites = $sites | Sort-Object -Unique
-          $Ansible.Result = [pscustomobject]@{
-            Sites = $sites
-            OnlyDesired = ($sites.Count -eq 1 -and $sites[0] -eq $TargetSite)
-          }
-        parameters:
-          TargetSite: "{{ vpn_site_fqdn }}"
-      register: site_check
-      changed_when: false
-      when: install_checkpoint | bool
-
 
     # ---------- Microsoft 365 Apps for enterprise via ODT ----------
     - name: Check if Word exists (idempotency gate)
