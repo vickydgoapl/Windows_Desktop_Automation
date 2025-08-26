@@ -9,12 +9,12 @@
 
   vars:
     # Toggle what to install
-    install_7zip: false
-    install_anydesk: false
-    install_chrome: false
-    install_adobe_reader: false         # Reader (free). For Acrobat Pro, see below.
-    install_adobe_acrobat_pro: false    # Needs Adobe Admin Console package
-    install_checkpoint: false           # Needs exact product + URL below
+    install_7zip: true
+    install_anydesk: true
+    install_chrome: true
+    install_adobe_reader: true         # Reader (free). For Acrobat Pro, see below.
+    install_adobe_acrobat_pro: true    # Needs Adobe Admin Console package
+    install_checkpoint: true           # Needs exact product + URL below
     install_m365_apps: true            # Office via ODT (en-US)
 
     # Optional version pins for choco packages
@@ -30,7 +30,7 @@
     acrobat_detect_path: 'C:\Program Files\Adobe\Acrobat\Acrobat\Acrobat.exe'
 
     # ---- Check Point (example: Endpoint Security VPN) ----
-    checkpoint_installer_local_path: "/mnt/c/Users/Vicky\ Deshpande/Downloads/Call\ Dumps/artefacts/E88.30_CheckPointVPN.msi"
+    checkpoint_installer_local_path: "<<checkpoint_installer_exe_file_local_path>>"
     checkpoint_product_id: null                 # if you know the MSI ProductCode GUID, set it
     checkpoint_creates_path: 'C:\Program Files (x86)\CheckPoint\Endpoint Connect\tracsrv.exe'  # adjust
     checkpoint_install_args: '/qn REBOOT=ReallySuppress'     # common MSI silent flags
@@ -46,7 +46,7 @@
     remove_other_sites: true                      # delete any site that isn't the one above
 
     # ---- Microsoft 365 Apps for enterprise (ODT) ----
-    odt_src_path: "/mnt/c/Users/Vicky\ Deshpande/Downloads/Call\ Dumps/artefacts/officedeploymenttool_18925-20138.exe"
+    odt_src_path: "<<m365_installer_local_path>>"
     odt_root: 'C:\Temp\ODT'
     # Channel options: Current, MonthlyEnterprise, SemiAnnualEnterprise
     m365_channel: 'Current'
