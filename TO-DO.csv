@@ -1,8 +1,8 @@
 Playbook, Status, Owner
-Outlook Configuration,,
+Outlook Configuration, Dropped, Sanjib
 OS Upgrade, Done, Sanjib
 Desktop Monitoring, Done, Vicky
-Desktop Configuration, WIP, Vicky
+Desktop Configuration, UAT, Vicky
 Temp folder clearance, Done, Sanjib
 Chrome Cache clearance, Done, Sanjib
 Startup/Disable apps, Done, Sanjib
@@ -10,4 +10,6 @@ Virtual Memory management, Done, Sanjib
 Config Drift Management, Done, Vicky
 Outlook and Thunderbird Email Archival, WIP, Sanjib
 Disk Defragmentation, Done, Vicky
-Local User Management, WIP, Vicky
+Local User Management, Done, Vicky
+AD User Management, WIP, Vicky
+Printer Config setup on Desktop, WIP, Vicky
