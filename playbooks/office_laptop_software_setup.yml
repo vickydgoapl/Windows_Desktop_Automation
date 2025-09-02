@@ -1,6 +1,6 @@
 ---
 - name: Install common apps on Windows the right way
-  hosts: windows_desktops
+  hosts: all
   gather_facts: yes
 
   collections:
@@ -9,19 +9,23 @@
 
   vars:
     # Toggle what to install
-    install_7zip: true
-    install_anydesk: true
-    install_chrome: true
-    install_adobe_reader: true         # Reader (free). For Acrobat Pro, see below.
-    install_adobe_acrobat_pro: true    # Needs Adobe Admin Console package
-    install_checkpoint: true           # Needs exact product + URL below
-    install_m365_apps: true            # Office via ODT (en-US)
+    install_7zip: false
+    install_anydesk: false
+    install_chrome: false
+    install_adobe_reader: false         # Reader (free). For Acrobat Pro, see below.
+    install_adobe_acrobat_pro: false    # Needs Adobe Admin Console package
+    install_checkpoint: false           # Needs exact product + URL below
+    install_m365_apps: false            # Office via ODT (en-US)
+    install_firefox: false               # Mozilla Firefox via Chocolatey
+    install_trendmicro: true            # Generic Trend Micro (Apex One/WF/…)
+    install_profactor: false           # Generic 3rd-party app (MSI/EXE)
 
     # Optional version pins for choco packages
     seven_zip_version: null             # e.g. "23.01"
     anydesk_version: null
     chrome_version: null
     adobereader_version: null
+    firefox_version: null
 
     # ---- Adobe Acrobat Pro (licensed) ----
     # Build a package in Adobe Admin Console, host it (SMB/HTTP), then set these:
@@ -30,7 +34,7 @@
     acrobat_detect_path: 'C:\Program Files\Adobe\Acrobat\Acrobat\Acrobat.exe'
 
     # ---- Check Point (example: Endpoint Security VPN) ----
-    checkpoint_installer_local_path: "<<checkpoint_installer_exe_file_local_path>>"
+    checkpoint_installer_local_path: "/home/admin/Ansible/Windows/Windows_Desktop_Automation/artefacts/E88.30_CheckPointVPN.msi"
     checkpoint_product_id: null                 # if you know the MSI ProductCode GUID, set it
     checkpoint_creates_path: 'C:\Program Files (x86)\CheckPoint\Endpoint Connect\tracsrv.exe'  # adjust
     checkpoint_install_args: '/qn REBOOT=ReallySuppress'     # common MSI silent flags
@@ -46,13 +50,49 @@
     remove_other_sites: true                      # delete any site that isn't the one above
 
     # ---- Microsoft 365 Apps for enterprise (ODT) ----
-    odt_src_path: "<<m365_installer_local_path>>"
+    odt_src_path: "/home/admin/Ansible/Windows/Windows_Desktop_Automation/artefacts/officedeploymenttool_18925-20138.exe"
     odt_root: 'C:\Temp\ODT'
     # Channel options: Current, MonthlyEnterprise, SemiAnnualEnterprise
     m365_channel: 'Current'
     m365_language: 'en-us'
     # Example app selection – tweak as needed
     m365_exclude_teams: true
+
+    # ---- Trend Micro (generic) ----
+    # Provide either an MSI or EXE; tasks handle both. Host locally or via UNC/HTTP.
+    # Choose: 'onprem' or 'saas'
+    apexone_mode: "onprem"
+
+    # Common paths/flags
+    apexone_creates_path: "C:\\Program Files\\Trend Micro\\Apex One\\NTRtScan.exe"
+    apexone_requires_reboot: false
+
+    # === ON-PREM package (Client Packager output) ===
+    # Provide the generated package EXE from your Apex One server (AutoPCC/setup)
+    apexone_onprem_pkg_local_path: "/home/admin/Ansible/Windows/Windows_Desktop_Automation/artefacts/agent_cloud_x64_fe2fb292-e699-46ee-85be-3bba81cc738a.msi"            # e.g. C:\Packages\ApexOne\AutoPCC.exe
+    apexone_onprem_silent_args: "/s /v\"/qn REBOOT=ReallySuppress\""           # typical for InstallShield-wrapped EXE
+    apexone_onprem_alt_msi_local_path: null                                    # if you have a raw MSI instead of EXE
+    apexone_onprem_msi_args: "/qn REBOOT=ReallySuppress"
+    apexone_onprem_product_id: null                                            # set MSI ProductCode GUID if you want
+
+    # Optional: if your packager expects server params at install-time (uncommon if baked in)
+    apexone_server: "apexone-srv.goapl.local"                                   # optional
+    apexone_server_port: 4343                                                   # optional
+
+    # === SAAS agent ===
+    # Download OfcCtmr.exe from Apex One SaaS console (it embeds region/tenant info)
+    apexone_saas_installer_local_path: "<<path_to_saas_OfcCtmr.exe>>"
+    # You typically pass an activation key/token; name varies by tenant build (examples below).
+    apexone_saas_activation_key: "<<YOUR_ENROLLMENT_KEY_OR_TOKEN>>"
+    # Silent flags (common pattern); keep the quotes escaping as-is
+    apexone_saas_silent_args: "/s /v\"/qn REBOOT=ReallySuppress\""
+    
+    # ---- Profactor (generic 3rd-party) ----
+    profactor_installer_local_path: "<<profactor_installer_path>>"    # MSI or EXE
+    profactor_install_args: "/qn"                                     # silent flags
+    profactor_product_id: null
+    profactor_creates_path: "C:\\Program Files\\Profactor\\App\\app.exe"  # adjust
+    profactor_requires_reboot: false
 
   tasks:
     # ---------- Chocolatey-based installs (auto-bootstraps Chocolatey) ----------
@@ -69,6 +109,13 @@
         state: present
         version: "{{ anydesk_version | default(omit) }}"
       when: install_anydesk | bool
+
+    - name: Mozilla Firefox (Chocolatey)
+      chocolatey.chocolatey.win_chocolatey:
+        name: firefox
+        state: present
+        version: "{{ firefox_version | default(omit) }}"
+      when: install_firefox | bool
 
     - name: Google Chrome (robust install)
       block:
@@ -125,33 +172,33 @@
         state: present
         creates_path: "{{ checkpoint_creates_path | default(omit) }}"
       when: install_checkpoint | bool
-    
-    - name: Reboot the machine and wait for 60 seconds before continuing
-      ansible.windows.win_reboot:
-      when: install_checkpoint | bool
 
-    - name: Stop VPN service
-      ansible.windows.win_service:
-        name: "{{ cp_paths.result.Service }}"
-        state: stopped
-      when: install_checkpoint | bool
+    #- name: Reboot the machine and wait for 60 seconds before continuing
+    #  ansible.windows.win_reboot:
+    #  when: install_checkpoint | bool
 
-    - name: Create the single allowed site (idempotent)
-      ansible.windows.win_powershell:
-        script: |
-          & "C:\Program Files (x86)\CheckPoint\Endpoint Connect\trac.exe" create -s "$Site" -di "$Site"
-          Stop-Process -Name TrGUI -ErrorAction SilentlyContinue
-          Start-Process "C:\Program Files (x86)\CheckPoint\Endpoint Connect\TrGUI.exe"
-        parameters:
-          Site:     "{{ vpn_site_fqdn }}"
-      changed_when: false
-      when: install_checkpoint | bool
+    #- name: Stop VPN service
+    #  ansible.windows.win_service:
+    #    name: "{{ cp_paths.result.Service }}"
+    #    state: stopped
+    #  when: install_checkpoint | bool
 
-    - name: Start VPN service
-      ansible.windows.win_service:
-        name: "{{ cp_paths.result.Service }}"
-        state: started
-      when: install_checkpoint | bool
+    #- name: Create the single allowed site (idempotent)
+    #  ansible.windows.win_powershell:
+    #    script: |
+    #      & "C:\Program Files (x86)\CheckPoint\Endpoint Connect\trac.exe" create -s "$Site" -di "$Site"
+    #      Stop-Process -Name TrGUI -ErrorAction SilentlyContinue
+    #      Start-Process "C:\Program Files (x86)\CheckPoint\Endpoint Connect\TrGUI.exe"
+    #    parameters:
+    #      Site:     "{{ vpn_site_fqdn }}"
+    #  changed_when: false
+    #  when: install_checkpoint | bool
+
+    #- name: Start VPN service
+    #  ansible.windows.win_service:
+    #    name: "{{ cp_paths.result.Service }}"
+    #    state: started
+    #  when: install_checkpoint | bool
 
     # ---------- Microsoft 365 Apps for enterprise via ODT ----------
     - name: Check if Word exists (idempotency gate)
@@ -235,3 +282,125 @@
     - name: Show specific date/time components
       ansible.builtin.debug:
         msg: "Current time: {{ end_time }}"
+
+    # ---------- Trend Micro Apex One ----------
+    - name: Ensure C:\Temp exists (Apex One)
+      ansible.windows.win_file:
+        path: C:\Temp
+        state: directory
+      when: install_trendmicro | bool
+
+    # ON-PREM: package EXE (Client Packager output)
+    - name: Copy Apex One on-prem package (EXE)
+      ansible.windows.win_copy:
+        src: "{{ apexone_onprem_pkg_local_path }}"
+        dest: "C:\\Temp\\ApexOne_OnPrem.exe"
+      when:
+        - install_trendmicro | bool
+        - apexone_mode == 'onprem'
+        - apexone_onprem_pkg_local_path is not none
+        - apexone_onprem_pkg_local_path | length > 0
+        - apexone_onprem_pkg_local_path | lower | regex_search('\\.exe$')
+
+    - name: Install Apex One on-prem (EXE, silent)
+      ansible.windows.win_command:
+        cmd: "C:\\Temp\\ApexOne_OnPrem.exe {{ apexone_onprem_silent_args }}"
+      args:
+        chdir: "C:\\Temp"
+      register: apexone_onprem_exe_install
+      changed_when: true
+      when:
+        - install_trendmicro | bool
+        - apexone_mode == 'onprem'
+        - apexone_onprem_pkg_local_path is not none
+        - apexone_onprem_pkg_local_path | lower | regex_search('\\.exe$')
+        - apexone_creates_path is defined
+        - not (ansible_facts is defined and ansible_facts | dict2items | length == 0)  # harmless gate
+      # Idempotency gate: skip if already installed
+      failed_when: false
+
+    # ON-PREM: raw MSI path (optional alternative)
+    - name: Copy Apex One on-prem MSI
+      ansible.windows.win_copy:
+        src: "{{ apexone_onprem_alt_msi_local_path }}"
+        dest: "C:\\Temp\\ApexOne_OnPrem.msi"
+      when:
+        - install_trendmicro | bool
+        - apexone_mode == 'onprem'
+        - apexone_onprem_alt_msi_local_path is not none
+        - apexone_onprem_alt_msi_local_path | lower | regex_search('\\.msi$')
+
+    - name: Install Apex One on-prem (MSI, silent)
+      ansible.windows.win_package:
+        path: "C:\\Temp\\ApexOne_OnPrem.msi"
+        product_id: "{{ apexone_onprem_product_id | default(omit) }}"
+        arguments: "{{ apexone_onprem_msi_args }}"
+        state: present
+        creates_path: "{{ apexone_creates_path | default(omit) }}"
+      when:
+        - install_trendmicro | bool
+        - apexone_mode == 'onprem'
+        - apexone_onprem_alt_msi_local_path is not none
+        - apexone_onprem_alt_msi_local_path | lower | regex_search('\\.msi$')
+
+    # SAAS: OfcCtmr.exe with activation/enrollment key
+    - name: Copy Apex One SaaS installer (OfcCtmr.exe)
+      ansible.windows.win_copy:
+        src: "{{ apexone_saas_installer_local_path }}"
+        dest: "C:\\Temp\\ApexOne_SaaS.exe"
+      when:
+        - install_trendmicro | bool
+        - apexone_mode == 'saas'
+        - apexone_saas_installer_local_path is not none
+        - apexone_saas_installer_local_path | lower | regex_search('\\.exe$')
+
+    - name: Install Apex One SaaS (EXE + activation key)
+      ansible.windows.win_command:
+        cmd: >
+          C:\Temp\ApexOne_SaaS.exe {{ apexone_saas_silent_args }}
+          ACTKEY="{{ apexone_saas_activation_key }}"
+      args:
+        chdir: "C:\\Temp"
+      register: apexone_saas_install
+      changed_when: true
+      when:
+        - install_trendmicro | bool
+        - apexone_mode == 'saas'
+        - apexone_saas_installer_local_path is not none
+        - apexone_saas_activation_key is not none
+        - apexone_saas_activation_key | length > 0
+
+    # Common: idempotency check + optional reboot
+    - name: Check Apex One agent binary (idempotency)
+      ansible.windows.win_stat:
+        path: "{{ apexone_creates_path }}"
+      register: apexone_bin
+      when: install_trendmicro | bool
+
+    - name: Reboot after Apex One install (optional)
+      ansible.windows.win_reboot:
+      when:
+        - install_trendmicro | bool
+        - apexone_requires_reboot | bool
+        - apexone_bin.stat.exists | default(false)
+
+    # Optional: verify core services are up (service names can vary by build)
+    - name: Ensure Trend Micro core service (NTRtScan) is running
+      ansible.windows.win_service:
+        name: "ntrtscan"
+        state: started
+      register: ntrtscan_service
+      failed_when: false
+      when:
+        - install_trendmicro | bool
+        - apexone_bin.stat.exists | default(false)
+
+    - name: Ensure Trend Micro kernel service is running (TMBMServer, best-effort)
+      ansible.windows.win_service:
+        name: "TMBMServer"
+        state: started
+      register: tmbm_service
+      failed_when: false
+      when:
+        - install_trendmicro | bool
+        - apexone_bin.stat.exists | default(false)
