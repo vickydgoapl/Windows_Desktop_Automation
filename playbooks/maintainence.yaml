@@ -1,6 +1,6 @@
 ---
 - name: Remote Windows Management
-  hosts: windows1
+  hosts: windows_desktops
   gather_facts: yes
   vars:
     usage_threshold_percent: 80

@@ -1,6 +1,6 @@
 ---
 - name: Upgrade Windows OS using win_updates
-  hosts: windows1  # Adjust to your target group (e.g., windows1)
+  hosts: windows_desktops  # Adjust to your target group (e.g., windows1)
   gather_facts: no
 
   tasks:
