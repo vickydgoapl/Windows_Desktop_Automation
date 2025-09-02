@@ -26,4 +26,6 @@ Set-Item WSMan:\localhost\Service\Auth\Kerberos $true
 # Do NOT allow plaintext; Ansible can do HTTPS easily
 Set-Item WSMan:\localhost\Service\AllowUnencrypted $false
 
+Set-NetConnectionProfile -InterfaceAlias "Wi-Fi" -NetworkCategory Private
+
 Restart-Service WinRM
