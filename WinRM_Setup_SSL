@@ -1,0 +1,58 @@
+# ------------------------------------------------------------
+# 1. Enable PowerShell remoting / WinRM
+# ------------------------------------------------------------
+Enable-PSRemoting -SkipNetworkProfileCheck -Force
+
+# ------------------------------------------------------------
+# 2. Import PFX certificate
+# ------------------------------------------------------------
+
+# Manually copy the pfx file in below location from the repository in the path "C:\Temp\"
+$pfxpath="C:\Temp\New_wildCard.pfx"
+
+$pfxpassword="Password@123"
+$wildcardDNS="*.indostar.com"
+
+$password=ConvertTo-SecureString -String $pfxpassword -Force -AsPlainText
+
+$cert=Import-PfxCertificate -FilePath $pfxpath -CertStoreLocation Cert:\LocalMachine\My -Password $password -Exportable 
+
+$thumb=$cert.Thumbprint
+
+# ------------------------------------------------------------
+# 4. Remove any existing HTTPS listeners (clean slate)
+# ------------------------------------------------------------
+winrm delete winrm/config/Listener?Address=*+Transport=HTTP 2>$null | Out-Null
+winrm delete winrm/config/Listener?Address=*+Transport=HTTPS 2>$null | Out-Null
+ 
+# ------------------------------------------------------------
+# 5. Create HTTPS listener using wildcard cert
+# ------------------------------------------------------------
+$param="@{Hostname=""*.indostar.com"";CertificateThumbprint=""$thumb""}"
+
+winrm create "winrm/config/Listener?Address=*+Transport=HTTPS" $param
+ 
+# ------------------------------------------------------------
+# 6. Authentication configuration
+# ------------------------------------------------------------
+Set-Item WSMan:\localhost\Service\Auth\Basic       $true     # HTTPS o nly
+Set-Item WSMan:\localhost\Service\Auth\Negotiate   $true
+Set-Item WSMan:\localhost\Service\Auth\Kerberos    $true     # domain joined
+
+# Never allow plaintext
+Set-Item WSMan:\localhost\Service\AllowUnencrypted $false
+ 
+# ------------------------------------------------------------
+# 7. Firewall rule for WinRM HTTPS
+# ------------------------------------------------------------
+New-NetFirewallRule -Name "WinRM-HTTPS-In" -DisplayName "WinRM HTTPS" -Protocol TCP -LocalPort 5986 -Action Allow -Direction Inbound
+ 
+# ------------------------------------------------------------
+# 8. Restart WinRM
+# ------------------------------------------------------------
+Restart-Service WinRM
+
+# ------------------------------------------------------------
+# 9. Delete the pfx file 
+# ------------------------------------------------------------
+Remove-Item -Path $pfxpath -Force -ErrorAction SilentlyContinue
